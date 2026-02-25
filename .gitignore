@@ -1,0 +1,27 @@
+# Large data / outputs / weights (not tracked in this repo)
+data/
+outputs/
+weights/
+representations/
+yth_rbp/
+.micromamba/
+
+# External / nested repositories (excluded from this repo)
+RNA-FM/
+RiNALMo/
+rnafm_mlp/
+
+# Model checkpoints / pretrained weights
+models/pretrained/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# OS / editor
+.DS_Store
+.vscode/
