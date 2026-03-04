@@ -15,10 +15,10 @@ class ETDMultiTaskModel(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.base_embed = nn.Embedding(7, 32)
-        self.pos_embed = nn.Embedding(12000, 32)
-        self.struct_proj = nn.Linear(8, 32)
-        self.input_proj = nn.Linear(96, 256)
+        self.base_embed = nn.Embedding(7, 32)#7-token vocab（A/C/G/U/N/PAD/MASK）到 32 维
+        self.pos_embed = nn.Embedding(12000, 32)#长度上限 12000，到 32 维
+        self.struct_proj = nn.Linear(8, 32)#结构局部特征
+        self.input_proj = nn.Linear(96, 256)#投影到 d_model=256
         self.input_norm = nn.LayerNorm(256)
 
         self.condition = ConditionEncoder(
@@ -58,7 +58,7 @@ class ETDMultiTaskModel(nn.Module):
         site_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if attn_mask is None:
-            attn_mask = tokens != 5
+            attn_mask = tokens != 5 # [bs, L, 1]
 
         bsz, length = tokens.shape
         device = tokens.device
@@ -71,18 +71,18 @@ class ETDMultiTaskModel(nn.Module):
 
         x = torch.cat(
             [
-                self.base_embed(tokens),
-                pos_emb,
-                self.struct_proj(struct_feats),
+                self.base_embed(tokens), #[bs, L, 32]
+                pos_emb,                   #[bs, L, 32]
+                self.struct_proj(struct_feats), #[bs, L, 32]
             ],
             dim=-1,
         )
-        x = self.input_norm(self.input_proj(x))
+        x = self.input_norm(self.input_proj(x)) #[bs, L, 256]
 
-        down_mask = downsample_mask(attn_mask, factor=16)
-        pair_mask = downsample_mask(attn_mask, factor=32)
+        down_mask = downsample_mask(attn_mask, factor=16)#序列主干 mask 下采样 [B, ceil(L/16)]
+        pair_mask = downsample_mask(attn_mask, factor=32)#pair 分支 mask 下采样 [B, ceil(L/32)]
 
-        struct_down_pair = downsample_1d(struct_feats, factor=32, mask=attn_mask)
+        struct_down_pair = downsample_1d(struct_feats, factor=32, mask=attn_mask) #[B, ceil(L/32),8]
         pair_feats = make_pair_features(struct_down_pair, pair_mask)
 
         cond = self.condition(cond_task, cond_role, cond_base)

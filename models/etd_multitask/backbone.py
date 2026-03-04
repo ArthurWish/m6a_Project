@@ -345,7 +345,7 @@ class ETDBackbone(nn.Module):
         self.pair_update = PairUpdateBlock(seq_dim=channels[-1], pair_dim=pair_dim, dropout=dropout)
         self.pair_input_proj = nn.Linear(4, pair_dim)
         self.pair_bias_proj = nn.Linear(pair_dim, n_heads, bias=False)
-
+        
         self.decoder = nn.ModuleList(
             [
                 DecoderBlock(in_ch=channels[-1], skip_ch=channels[-1], out_ch=channels[-1], upsample=False),

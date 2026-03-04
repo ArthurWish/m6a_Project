@@ -106,6 +106,35 @@ python scripts/training/train_etd_multitask.py \
   --output-dir outputs/etd_multitask/full_run
 ```
 
+也可以将训练参数集中写入 JSON 配置文件（示例：`scripts/training/configs/train_etd_multitask_full.json`）：
+
+```bash
+python scripts/training/train_etd_multitask.py \
+  --config scripts/training/configs/train_etd_multitask_full.json
+```
+
+命令行参数会覆盖配置文件中的同名项，例如：
+
+```bash
+python scripts/training/train_etd_multitask.py \
+  --config scripts/training/configs/train_etd_multitask_full.json \
+  --output-dir outputs/etd_multitask/full_run_alt \
+  --epochs 3
+```
+
+启用 TensorBoard（脚本支持写入 `events`）：
+
+```bash
+python scripts/training/train_etd_multitask.py \
+  --config scripts/training/configs/train_etd_multitask_full.json \
+  --tensorboard \
+  --tb-dir outputs/etd_multitask/full_run/tb
+```
+
+```bash
+tensorboard --logdir outputs/etd_multitask/full_run/tb --port 6006
+```
+
 ### 5) 评估
 ```bash
 python scripts/training/eval_etd_multitask.py \

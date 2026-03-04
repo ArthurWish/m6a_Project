@@ -63,6 +63,7 @@ def _sanitize_sequence(seq: str) -> str:
     return "".join(ch if ch in allowed else "N" for ch in seq)
 
 
+# 这里逻辑不对，现在的逻辑是把所有6修饰位置全部换了，但m6a_positions只是说这些位置的A能换成6，但不是在同一个序列中都是6
 def _apply_modification(seq: str, m6a_positions: list[int]) -> str:
     chars = list(seq)
     for pos in m6a_positions:
