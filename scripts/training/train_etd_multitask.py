@@ -8,6 +8,7 @@ import ctypes
 import math
 import os
 import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -243,6 +244,8 @@ def _prepare_data_and_priors(cfg: dict):
     5) bind_priors
     6) strong_thresholds
     """
+    t0 = time.perf_counter()
+    print("[data] loading train split ...", flush=True)
     train_examples = load_examples(
         sites_path=cfg["sites"],
         transcripts_path=cfg["transcripts"],
@@ -252,16 +255,29 @@ def _prepare_data_and_priors(cfg: dict):
         smoke_ratio=float(cfg["smoke_ratio"]),
         seed=int(cfg["seed"]),
     )
+    print(
+        f"[data] train loaded: n={len(train_examples)} elapsed={time.perf_counter() - t0:.2f}s",
+        flush=True,
+    )
+    t1 = time.perf_counter()
+    print("[data] loading val split ...", flush=True)
+    # 默认让 train/val 共享 smoke_ratio，便于一次参数同时缩放训练与验证规模。
+    val_smoke_ratio = float(cfg["smoke_ratio"])
     val_examples = load_examples(
         sites_path=cfg["sites"],
         transcripts_path=cfg["transcripts"],
         splits_path=cfg["splits"],
         split_names=["val"],
         max_len=int(cfg["max_len"]),
-        smoke_ratio=1.0,
+        smoke_ratio=val_smoke_ratio,
         seed=int(cfg["seed"]),
     )
+    print(
+        f"[data] val loaded: n={len(val_examples)} elapsed={time.perf_counter() - t1:.2f}s",
+        flush=True,
+    )
 
+    t2 = time.perf_counter()
     if str(cfg.get("struct_source", "precomputed")) == "online":
         struct_provider = OnlineRNAfoldProvider(
             rnafold_bin=str(cfg.get("online_rnafold_bin", "RNAfold")),
@@ -270,9 +286,20 @@ def _prepare_data_and_priors(cfg: dict):
         )
     else:
         struct_provider = BPPCache(cfg["rnafold_cache"])
+    print(
+        f"[data] struct provider ready: source={cfg.get('struct_source', 'precomputed')} "
+        f"elapsed={time.perf_counter() - t2:.2f}s",
+        flush=True,
+    )
+    t3 = time.perf_counter()
     mod_prior = estimate_mod_prior(train_examples)
     bind_priors = estimate_binding_priors(train_examples)
     strong_thresholds = estimate_strong_binding_thresholds(train_examples, q=0.75)
+    print(
+        f"[data] priors ready: mod_prior={mod_prior:.6f} "
+        f"bind_priors={bind_priors} elapsed={time.perf_counter() - t3:.2f}s",
+        flush=True,
+    )
     return train_examples, val_examples, struct_provider, mod_prior, bind_priors, strong_thresholds
 
 
@@ -363,13 +390,22 @@ def _run_train_epoch(
     - global_step: 更新后的全局 batch 计数
     - optim_step: 更新后的优化器步数（受 grad_accum 影响）
     """
+    batch_log_interval = int(cfg.get("batch_log_interval", 10))
+    batch_log_interval = max(1, batch_log_interval)
+
     model.train()
+    t_build_batches = time.perf_counter()
     batches = build_length_bucketed_batches(
         examples=train_examples,
         batch_token_budget=int(cfg["batch_token_budget"]),
         boundaries=boundaries,
         shuffle=True,
         seed=int(cfg["seed"]) + epoch,
+    )
+    print(
+        f"[epoch {epoch:03d}] built {len(batches)} batches "
+        f"in {time.perf_counter() - t_build_batches:.2f}s",
+        flush=True,
     )
     optimizer.zero_grad(set_to_none=True)
 
@@ -385,6 +421,7 @@ def _run_train_epoch(
     }
 
     for batch_idx, batch_examples in enumerate(batches, start=1):
+        t_batch = time.perf_counter()
         # 多任务轮转：按全局步在 task_cycle 中循环。
         task_name = task_cycle[global_step % len(task_cycle)]
         # 每个 batch 构造独立 RNG，保证同一 seed 可复现。
@@ -406,6 +443,7 @@ def _run_train_epoch(
         # cond_base 做保护性兜底，防止非法值破坏映射。
         struct_base = cond_base if cond_base in COND_BASE_IDS else "mask"
 
+        t_collate = time.perf_counter()
         batch = collate_batch(
             examples=batch_examples,
             task_name=task_name,
@@ -420,6 +458,7 @@ def _run_train_epoch(
             aprime_prob=float(cfg["aprime_prob"]),
             aprime_max_per_seq=int(cfg["aprime_max_per_seq"]),
         )
+        collate_elapsed = time.perf_counter() - t_collate
         batch = to_device(batch, device)
 
         # 组装条件 token（task/role/base）送入模型条件分支。
@@ -439,6 +478,7 @@ def _run_train_epoch(
         # legacy 策略下，base=A 视为监督更强的条件。
         supervised_a = cond_base == "A"
 
+        t_forward = time.perf_counter()
         with torch.amp.autocast(device_type="cuda", enabled=use_amp and device.type == "cuda"):
             outputs = model(
                 tokens=tokens_in,
@@ -468,13 +508,16 @@ def _run_train_epoch(
             loss_mlm = losses["loss_mlm"]
             loss_unc = losses["loss_unc"]
             loss_dir = losses["loss_dir"]
+        forward_elapsed = time.perf_counter() - t_forward
 
         # 梯度累积：反传前先除以累积步数，保证等效梯度尺度稳定。
+        t_backward = time.perf_counter()
         loss_for_step = loss_total / int(cfg["grad_accum"])
         if not loss_for_step.requires_grad:
             loss_for_step = loss_for_step + 0.0 * outputs["mod_logits_acu"].sum()
         scaler.scale(loss_for_step).backward()
 
+        did_optim_step = False
         if (batch_idx % int(cfg["grad_accum"]) == 0) or (batch_idx == len(batches)):
             # 优化前先反缩放并做梯度裁剪，抑制异常梯度。
             scaler.unscale_(optimizer)
@@ -484,6 +527,8 @@ def _run_train_epoch(
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
             optim_step += 1
+            did_optim_step = True
+        backward_elapsed = time.perf_counter() - t_backward
 
         agg["loss_total"] += float(loss_total.detach().cpu())
         agg["loss_bind"] += float(loss_bind.detach().cpu())
@@ -506,6 +551,25 @@ def _run_train_epoch(
             writer.add_scalar("train/lr_step", optimizer.param_groups[0]["lr"], global_step)
 
         global_step += 1
+
+        if (
+            batch_idx == 1
+            or batch_idx == len(batches)
+            or (batch_idx % batch_log_interval == 0)
+            or (collate_elapsed >= 30.0)
+        ):
+            tokens_count = int(sum(x.seq_len for x in batch_examples))
+            max_seq_len = int(max(x.seq_len for x in batch_examples))
+            print(
+                f"[epoch {epoch:03d}][{batch_idx:04d}/{len(batches):04d}] "
+                f"task={task_name} role={sampled_role} cond=({cond_role},{cond_base}) "
+                f"bsz={len(batch_examples)} tokens={tokens_count} max_len={max_seq_len} "
+                f"collate={collate_elapsed:.2f}s forward={forward_elapsed:.2f}s "
+                f"backward={backward_elapsed:.2f}s step={'Y' if did_optim_step else 'N'} "
+                f"loss={float(loss_total.detach().cpu()):.4f} "
+                f"batch_total={time.perf_counter() - t_batch:.2f}s",
+                flush=True,
+            )
 
     for key in list(agg.keys()):
         if key.startswith("loss_"):

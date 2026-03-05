@@ -145,14 +145,13 @@ def compute_multitask_losses(
             )
 
     # ---- mod 任务 ----
-    # 当前策略：仅在 supervised_a 条件下计算 mod 的 nnPU 主损失。
+    # 当前策略：在 mod 任务中始终计算 nnPU 主损失（不再受 supervised_a 门控）。
     elif task_name == "mod":
-        if supervised_a:
-            loss_mod = mod_pu_loss(
-                logits=outputs["mod_logits_acu"][..., 0],
-                labels=batch["mod_pu_labels"],
-                mask=batch["mod_pu_mask"],
-            )
+        loss_mod = mod_pu_loss(
+            logits=outputs["mod_logits_acu"][..., 0],
+            labels=batch["mod_pu_labels"],
+            mask=batch["mod_pu_mask"],
+        )
 
     # ---- struct 任务 ----
     # 使用 BCE + Dice 组合损失；可由 ablation 开关关闭。

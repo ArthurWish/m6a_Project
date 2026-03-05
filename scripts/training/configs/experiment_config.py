@@ -20,6 +20,32 @@ from pathlib import Path
 import torch
 
 
+def _builtin_preset(name: str) -> dict:
+    """返回内置实验预设。
+
+    当前支持：
+    - default: 不覆盖 parser 默认值
+    - smoke_gpu: 在线结构小样本冒烟（按当前联调命令固化）
+    """
+    if name == "default":
+        return {}
+    if name == "smoke_gpu":
+        return {
+            "epochs": 1,
+            "smoke_ratio": 0.005,
+            "batch_token_budget": 4096,
+            "max_len": 2000,
+            "device": "cuda",
+            "struct_source": "online",
+            "online_rnafold_bin": "/root/miniconda3/envs/m6a/bin/RNAfold",
+            "online_rnafold_timeout_seconds": 900,
+            "batch_log_interval": 1,
+            "output_dir": "outputs/etd_multitask/smoke_run_gpu_online_0005",
+            "tensorboard": False,
+        }
+    raise ValueError(f"Unknown preset: {name}")
+
+
 def build_train_arg_parser(repo_root: Path) -> argparse.ArgumentParser:
     """构建训练实验参数解析器。
 
@@ -38,6 +64,12 @@ def build_train_arg_parser(repo_root: Path) -> argparse.ArgumentParser:
         "--config",
         default="",
         help="Path to config file (.json/.py). CLI args override config values.",
+    )
+    parser.add_argument(
+        "--preset",
+        default="default",
+        choices=["default", "smoke_gpu"],
+        help="Built-in experiment preset. Applied before --config and CLI overrides.",
     )
 
     # ---- 数据路径与规模 ----
@@ -114,6 +146,7 @@ def build_train_arg_parser(repo_root: Path) -> argparse.ArgumentParser:
     parser.add_argument("--tensorboard", action="store_true")
     parser.add_argument("--tb-dir", default="")
     parser.add_argument("--tb-log-steps", type=int, default=20)
+    parser.add_argument("--batch-log-interval", type=int, default=10)
     return parser
 
 
@@ -154,9 +187,15 @@ def parse_train_args(repo_root: Path) -> argparse.Namespace:
     """
     bootstrap = argparse.ArgumentParser(add_help=False)
     bootstrap.add_argument("--config", default="")
+    bootstrap.add_argument("--preset", default="default")
     known, _ = bootstrap.parse_known_args()
 
     parser = build_train_arg_parser(repo_root)
+
+    # 先应用内置预设，再叠加配置文件，最后由 CLI 覆盖。
+    preset_payload = _builtin_preset(str(known.preset))
+    if preset_payload:
+        parser.set_defaults(**preset_payload)
 
     if known.config:
         config_path = Path(known.config)
