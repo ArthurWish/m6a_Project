@@ -13,7 +13,8 @@ ID_TO_BASE = {value: key for key, value in BASE_TO_ID.items()}
 
 PAD_TOKEN_ID = 5
 MASK_TOKEN_ID = 6
-VOCAB_SIZE = 7
+APRIME_TOKEN_ID = 7
+VOCAB_SIZE = 8
 
 TASK_IDS = {
     "bind": 0,

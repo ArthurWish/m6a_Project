@@ -163,7 +163,7 @@ def main() -> None:
     model.load_state_dict(state, strict=True)
     model.eval()
 
-    bpp_cache = BPPCache(args.rnafold_cache)
+    struct_provider = BPPCache(args.rnafold_cache)
 
     batches = build_length_bucketed_batches(
         examples=examples,
@@ -185,7 +185,7 @@ def main() -> None:
                     task_name="bind",
                     role_name=args.role,
                     cond_base=base,
-                    bpp_cache=bpp_cache,
+                    struct_provider=struct_provider,
                     strong_binding_threshold=1.0,
                     rng=random.Random(0),
                     mod_unlabeled_ratio=1.0,

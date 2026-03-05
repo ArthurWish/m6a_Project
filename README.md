@@ -106,18 +106,18 @@ python scripts/training/train_etd_multitask.py \
   --output-dir outputs/etd_multitask/full_run
 ```
 
-也可以将训练参数集中写入 JSON 配置文件（示例：`scripts/training/configs/train_etd_multitask_full.json`）：
+也可以将训练参数集中写入 Python 配置文件（示例：`scripts/training/configs/train_etd_multitask_full.py`）：
 
 ```bash
 python scripts/training/train_etd_multitask.py \
-  --config scripts/training/configs/train_etd_multitask_full.json
+  --config scripts/training/configs/train_etd_multitask_full.py
 ```
 
 命令行参数会覆盖配置文件中的同名项，例如：
 
 ```bash
 python scripts/training/train_etd_multitask.py \
-  --config scripts/training/configs/train_etd_multitask_full.json \
+  --config scripts/training/configs/train_etd_multitask_full.py \
   --output-dir outputs/etd_multitask/full_run_alt \
   --epochs 3
 ```
@@ -126,7 +126,7 @@ python scripts/training/train_etd_multitask.py \
 
 ```bash
 python scripts/training/train_etd_multitask.py \
-  --config scripts/training/configs/train_etd_multitask_full.json \
+  --config scripts/training/configs/train_etd_multitask_full.py \
   --tensorboard \
   --tb-dir outputs/etd_multitask/full_run/tb
 ```

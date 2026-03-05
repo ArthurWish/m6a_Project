@@ -7,6 +7,7 @@ from torch import nn
 
 from .backbone import ETDBackbone
 from .condition import ConditionEncoder
+from .constants import PAD_TOKEN_ID, VOCAB_SIZE
 from .heads import BindDirichletHead, MaskHead, ModHead, StructHead
 from .utils import downsample_1d, downsample_mask, make_pair_features
 
@@ -15,7 +16,7 @@ class ETDMultiTaskModel(nn.Module):
     def __init__(self):
         super().__init__()
 
-        self.base_embed = nn.Embedding(7, 32)#7-token vocab（A/C/G/U/N/PAD/MASK）到 32 维
+        self.base_embed = nn.Embedding(VOCAB_SIZE, 32)
         self.pos_embed = nn.Embedding(12000, 32)#长度上限 12000，到 32 维
         self.struct_proj = nn.Linear(8, 32)#结构局部特征
         self.input_proj = nn.Linear(96, 256)#投影到 d_model=256
@@ -58,7 +59,7 @@ class ETDMultiTaskModel(nn.Module):
         site_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         if attn_mask is None:
-            attn_mask = tokens != 5 # [bs, L, 1]
+            attn_mask = tokens != PAD_TOKEN_ID
 
         bsz, length = tokens.shape
         device = tokens.device

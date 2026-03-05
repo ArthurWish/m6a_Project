@@ -1,6 +1,6 @@
 import random
 
-from scripts.training.train_etd_multitask import _apply_condition_mask
+from models.etd_multitask.data import apply_condition_mask
 
 
 def test_condition_mask_ratio_close_to_target():
@@ -9,7 +9,7 @@ def test_condition_mask_ratio_close_to_target():
     role_masked = 0
     base_masked = 0
     for _ in range(n):
-        cond_role, cond_base = _apply_condition_mask(
+        cond_role, cond_base = apply_condition_mask(
             task_name="bind",
             sampled_role="reader",
             sampled_base="A",
@@ -30,7 +30,7 @@ def test_condition_mask_ratio_close_to_target():
 
 def test_mask_task_keeps_fixed_condition():
     rng = random.Random(123)
-    cond_role, cond_base = _apply_condition_mask(
+    cond_role, cond_base = apply_condition_mask(
         task_name="mask",
         sampled_role="none",
         sampled_base="mask",

@@ -180,3 +180,63 @@ def structure_bce_dice_loss(
 
     # 组合损失。
     return bce + dice
+
+
+def grouped_binding_loss(
+    logits: torch.Tensor,
+    alpha: torch.Tensor,
+    uncertainty: torch.Tensor,
+    g1_mask: torch.Tensor,
+    g2_mask: torch.Tensor,
+    g3_mask: torch.Tensor,
+    g5_mask: torch.Tensor,
+    g3_prob_max: float = 0.3,
+    g5_prob_max: float = 0.2,
+    g5_unc_min: float = 0.6,
+    g1_unc_max: float = 0.2,
+) -> dict[str, torch.Tensor]:
+    """按 G1~G5 分组规则构建 bind 任务损失。
+
+    分组语义（由 collate_batch 提供 mask）：
+    - G1: m6A + A' + role=1   -> 高概率、低不确定度、正例证据增强
+    - G2: m6A + A' + role=-1  -> PU 的 unlabeled 端
+    - G3: m6A + A  + role=1   -> 负向约束（不应高概率）
+    - G5: 非 m6A 的 A         -> 低概率 + 高不确定度锚定
+
+    返回值字段：
+    - core: 主监督项（G1/G2/G3/G5 的概率约束）
+    - dir:  证据项（G1）
+    - unc:  不确定度项（G1/G5）
+    """
+
+    def _zero() -> torch.Tensor:
+        return logits.new_tensor(0.0)
+
+    probs = torch.sigmoid(logits)
+
+    # G1: 正样本核心监督（希望 logit 高）。
+    loss_g1_pos = F.softplus(-logits[g1_mask]).mean() if g1_mask.any() else _zero()
+    # G2: unlabeled 端（与 PU 的 U 风险方向一致）。
+    loss_g2_unl = F.softplus(logits[g2_mask]).mean() if g2_mask.any() else _zero()
+    # G3: 负向约束，抑制未 reveal 的正位点出现过高结合概率。
+    loss_g3 = F.relu(probs[g3_mask] - g3_prob_max).mean() if g3_mask.any() else _zero()
+    # G5: 普通 A 锚点，概率不应高。
+    loss_g5_prob = F.relu(probs[g5_mask] - g5_prob_max).mean() if g5_mask.any() else _zero()
+
+    core = loss_g1_pos + loss_g2_unl + loss_g3 + loss_g5_prob
+
+    # G1 evidential 正例项：鼓励正类证据与强度。
+    loss_dir = evidential_positive_loss(alpha, positive_mask=g1_mask)
+
+    # 不确定度约束：
+    # - G1 需要低不确定度
+    # - G5 需要高不确定度
+    loss_g1_unc = F.relu(uncertainty[g1_mask] - g1_unc_max).mean() if g1_mask.any() else _zero()
+    loss_g5_unc = F.relu(g5_unc_min - uncertainty[g5_mask]).mean() if g5_mask.any() else _zero()
+    loss_unc = loss_g1_unc + loss_g5_unc
+
+    return {
+        "core": core,
+        "dir": loss_dir,
+        "unc": loss_unc,
+    }

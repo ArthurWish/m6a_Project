@@ -94,7 +94,7 @@ def evaluate_binding(
     model: ETDMultiTaskModel,
     examples,
     role: str,
-    bpp_cache: BPPCache,
+    struct_provider: BPPCache,
     boundaries: list[int],
     batch_token_budget: int,
     device: torch.device,
@@ -121,7 +121,7 @@ def evaluate_binding(
                 task_name="bind",
                 role_name=role,
                 cond_base="A",
-                bpp_cache=bpp_cache,
+                struct_provider=struct_provider,
                 strong_binding_threshold=1.0,
                 rng=random.Random(0),
                 mod_unlabeled_ratio=1.0,
@@ -195,7 +195,7 @@ def evaluate_binding(
 def evaluate_mod(
     model: ETDMultiTaskModel,
     examples,
-    bpp_cache: BPPCache,
+    struct_provider: BPPCache,
     boundaries: list[int],
     batch_token_budget: int,
     device: torch.device,
@@ -219,7 +219,7 @@ def evaluate_mod(
                 task_name="mod",
                 role_name="reader",
                 cond_base="A",
-                bpp_cache=bpp_cache,
+                struct_provider=struct_provider,
                 strong_binding_threshold=1.0,
                 rng=random.Random(0),
                 mod_unlabeled_ratio=1.0,
@@ -267,7 +267,7 @@ def evaluate_mod(
 def evaluate_structure(
     model: ETDMultiTaskModel,
     examples,
-    bpp_cache: BPPCache,
+    struct_provider: BPPCache,
     boundaries: list[int],
     batch_token_budget: int,
     max_struct_len: int,
@@ -295,7 +295,7 @@ def evaluate_structure(
                 task_name="struct",
                 role_name="reader",
                 cond_base="A",
-                bpp_cache=bpp_cache,
+                struct_provider=struct_provider,
                 strong_binding_threshold=1.0,
                 rng=random.Random(0),
                 mod_unlabeled_ratio=1.0,
@@ -339,7 +339,7 @@ def evaluate_structure(
 def evaluate_mask(
     model: ETDMultiTaskModel,
     examples,
-    bpp_cache: BPPCache,
+    struct_provider: BPPCache,
     boundaries: list[int],
     batch_token_budget: int,
     device: torch.device,
@@ -363,7 +363,7 @@ def evaluate_mask(
                 task_name="mask",
                 role_name="reader",
                 cond_base="mask",
-                bpp_cache=bpp_cache,
+                struct_provider=struct_provider,
                 strong_binding_threshold=1.0,
                 rng=random.Random(0),
                 mod_unlabeled_ratio=1.0,
@@ -427,7 +427,7 @@ def main() -> None:
     state = payload.get("model_state", payload)
     model.load_state_dict(state, strict=True)
 
-    bpp_cache = BPPCache(args.rnafold_cache)
+    struct_provider = BPPCache(args.rnafold_cache)
 
     results = {
         "checkpoint": args.checkpoint,
@@ -444,7 +444,7 @@ def main() -> None:
             model=model,
             examples=examples,
             role=role,
-            bpp_cache=bpp_cache,
+            struct_provider=struct_provider,
             boundaries=boundaries,
             batch_token_budget=args.batch_token_budget,
             device=device,
@@ -453,7 +453,7 @@ def main() -> None:
     results["mod"] = evaluate_mod(
         model=model,
         examples=examples,
-        bpp_cache=bpp_cache,
+        struct_provider=struct_provider,
         boundaries=boundaries,
         batch_token_budget=args.batch_token_budget,
         device=device,
@@ -462,7 +462,7 @@ def main() -> None:
     results["structure"] = evaluate_structure(
         model=model,
         examples=examples,
-        bpp_cache=bpp_cache,
+        struct_provider=struct_provider,
         boundaries=boundaries,
         batch_token_budget=args.batch_token_budget,
         max_struct_len=args.max_struct_len,
@@ -472,7 +472,7 @@ def main() -> None:
     results["mask"] = evaluate_mask(
         model=model,
         examples=examples,
-        bpp_cache=bpp_cache,
+        struct_provider=struct_provider,
         boundaries=boundaries,
         batch_token_budget=args.batch_token_budget,
         device=device,
