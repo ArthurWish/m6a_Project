@@ -166,19 +166,29 @@ def encode_with_optional_aprime(
     """编码序列并按配置可选执行 A' 替换。
 
     这是从 `data.collate_batch` 抽离出的工具函数，便于把 A' 逻辑集中维护。
+
+    当前策略（单点替换）：
+    - aprime_enable=False: 不替换。
+    - aprime_enable=True:
+      aprime_prob 作为“该样本是否执行 A' 增强”的门控概率；
+      一旦命中门控，就只在 m6A 候选里随机替换 1 个 A->A'。
+    - 因此，替换结果 `replaced_positions` 的长度只会是 0 或 1。
     """
     seq_ids = np.asarray(encode_sequence(sequence), dtype=np.int64)
     replaced_positions = np.zeros((0,), dtype=np.int64)
     if aprime_enable:
-        max_replace = None if aprime_max_per_seq < 0 else int(aprime_max_per_seq)
-        seq_ids, replaced_positions = build_mod_aprime_view(
-            seq_ids=seq_ids,
-            m6a_positions=m6a_positions,
-            rng=rng_aprime,
-            enable=True,
-            replace_prob=float(aprime_prob),
-            a_token_id=int(a_token_id),
-            aprime_token_id=int(APRIME_TOKEN_ID),
-            max_replace_per_sequence=max_replace,
-        )
+        # 单点替换门控：按 aprime_prob 决定该样本是否做 A' 增强。
+        if rng_aprime.random() < float(aprime_prob):
+            # 命中后固定只替换 1 个候选位点，保持四个任务输入一致且可解释。
+            # 这里不再使用 aprime_max_per_seq；策略统一为“最多 1 个”。
+            seq_ids, replaced_positions = build_mod_aprime_view(
+                seq_ids=seq_ids,
+                m6a_positions=m6a_positions,
+                rng=rng_aprime,
+                enable=True,
+                replace_prob=1.0,
+                a_token_id=int(a_token_id),
+                aprime_token_id=int(APRIME_TOKEN_ID),
+                max_replace_per_sequence=1,
+            )
     return seq_ids, replaced_positions

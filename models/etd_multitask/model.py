@@ -57,6 +57,7 @@ class ETDMultiTaskModel(nn.Module):
         struct_feats: torch.Tensor | None = None,
         site_positions: torch.Tensor | None = None,
         site_mask: torch.Tensor | None = None,
+        compute_struct: bool = True,
     ) -> dict[str, torch.Tensor]:
         if attn_mask is None:
             attn_mask = tokens != PAD_TOKEN_ID
@@ -109,7 +110,12 @@ class ETDMultiTaskModel(nn.Module):
             site_mask = site_positions >= 0
 
         bind_out = self.bind_head(decoded, site_positions=site_positions, site_mask=site_mask)
-        struct_logits = self.struct_head(bottleneck, adjacency_logits)
+        if compute_struct:
+            struct_logits = self.struct_head(bottleneck, adjacency_logits)
+        else:
+            # 结构任务消融时跳过 StructHead 的 CUDA 计算，降低不必要的图复杂度。
+            p = bottleneck.shape[1]
+            struct_logits = decoded.new_zeros((bsz, p, p))
 
         return {
             "mask_logits": mask_logits,

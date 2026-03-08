@@ -82,7 +82,48 @@ python scripts/dataset/generate_rnafold_bpp_cache.py \
 - 解析 `*_dp.ps` 中 `%start of base pair probability data` 后的 `ubox` 行
 - 缓存输出到 `data/processed/rnafold_bpp/*.npz`
 
-### 3) 训练（10% smoke 示例）
+### 2.1) 单点替换 RNAfold 稠密缓存（分片 + 可续跑）
+```bash
+# 4 个分片并行（tmux）
+tmux new-session -d -s fold0 "bash scripts/dataset/run_rnafold_dense_shard0.sh"
+tmux new-session -d -s fold1 "bash scripts/dataset/run_rnafold_dense_shard1.sh"
+tmux new-session -d -s fold2 "bash scripts/dataset/run_rnafold_dense_shard2.sh"
+tmux new-session -d -s fold3 "bash scripts/dataset/run_rnafold_dense_shard3.sh"
+```
+
+```bash
+# 中途停止（主进程 + 子进程 RNAfold）
+pkill -f "build_rnafold_single_site_dense_cache.py --max-len 12000"
+pkill -f "/root/miniconda3/envs/m6a/bin/RNAfold -p --noLP -d2 --modifications"
+```
+
+```bash
+# 续跑（不要加 --overwrite）
+bash scripts/dataset/run_rnafold_dense_shard0.sh
+bash scripts/dataset/run_rnafold_dense_shard1.sh
+bash scripts/dataset/run_rnafold_dense_shard2.sh
+bash scripts/dataset/run_rnafold_dense_shard3.sh
+```
+
+续跑机制说明：
+- 输出按 transcript 写入 `data/processed/rnafold_single_site_dense/<transcript_id>.npz`。
+- 已存在的 `.npz` 会自动 `skipped`，因此中断后可直接续跑。
+- 只有显式传 `--overwrite` 才会重算并覆盖。
+
+### 3) 训练（smoke 预设，推荐）
+```bash
+python scripts/training/train_etd_multitask.py --preset smoke_gpu
+```
+
+`smoke_gpu` 预设当前默认：
+- `ablate_no_struct=True`（不训练结构任务，不初始化/使用 RNAfold provider）
+- `loss_w_struct=0.0`
+- `disable_cudnn=True`（规避部分环境下的 CUDA 非法访存）
+- 默认不开 AMP（仅在显式传 `--amp` 时开启）
+
+如需手工指定参数，示例如下：
+
+### 3.1) 训练（手工 smoke 示例）
 ```bash
 python scripts/training/train_etd_multitask.py \
   --smoke-ratio 0.1 \

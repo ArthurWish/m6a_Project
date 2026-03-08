@@ -103,20 +103,13 @@ def downsample_1d(features: torch.Tensor, factor: int, mask: torch.Tensor | None
 
 
 def make_pair_features(struct_down: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
-    """Build pairwise features from per-position structure features.
+    """Build pairwise features using distance only.
 
     Returns [B, L, L, 4].
+    约定：当前仅使用距离先验，前 3 个通道置 0，第 4 通道为归一化 |i-j|。
     """
     bsz, length, _ = struct_down.shape
     device = struct_down.device
-
-    pair_prob = struct_down[..., 0]
-    pair_count = struct_down[..., 1]
-
-    prob_i = pair_prob.unsqueeze(2)
-    prob_j = pair_prob.unsqueeze(1)
-    cnt_i = pair_count.unsqueeze(2)
-    cnt_j = pair_count.unsqueeze(1)
 
     idx = torch.arange(length, device=device, dtype=torch.float32)
     dist = (idx[None, :, None] - idx[None, None, :]).abs()
@@ -125,12 +118,13 @@ def make_pair_features(struct_down: torch.Tensor, valid_mask: torch.Tensor) -> t
 
     valid2d = (valid_mask.unsqueeze(2) & valid_mask.unsqueeze(1)).float()
 
+    zeros = torch.zeros_like(dist)
     pair_feats = torch.stack(
         [
-            (prob_i + prob_j) * 0.5,
-            (cnt_i + cnt_j) * 0.5,
+            zeros,
+            zeros,
+            zeros,
             dist,
-            prob_i * prob_j,
         ],
         dim=-1,
     )

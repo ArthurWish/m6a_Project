@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import ctypes
 import math
 import os
 import random
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -82,6 +84,40 @@ def parse_args() -> argparse.Namespace:
     return parse_train_args(REPO_ROOT)
 
 
+class _TeeStream:
+    """Mirror writes to terminal and a log file."""
+
+    def __init__(self, terminal, file_handle):
+        self._terminal = terminal
+        self._file = file_handle
+
+    def write(self, data):
+        self._terminal.write(data)
+        self._file.write(data)
+
+    def flush(self):
+        self._terminal.flush()
+        self._file.flush()
+
+
+def _setup_train_log_file(out_dir: Path):
+    """Route stdout/stderr to both terminal and output_dir/train.log."""
+    log_path = out_dir / "train.log"
+    fh = log_path.open("a", encoding="utf-8")
+    sys.stdout = _TeeStream(sys.stdout, fh)
+    sys.stderr = _TeeStream(sys.stderr, fh)
+
+    def _cleanup():
+        try:
+            fh.flush()
+            fh.close()
+        except Exception:
+            pass
+
+    atexit.register(_cleanup)
+    print(f"[log] writing training logs to {log_path}", flush=True)
+
+
 def to_device(batch: dict, device: torch.device) -> dict:
     """将 batch 内所有张量移动到指定 device。
 
@@ -132,6 +168,7 @@ def evaluate_reader_binding(
     model: ETDMultiTaskModel,
     examples,
     struct_provider: Any,
+    use_rnafold_struct_feats: bool,
     strong_thresholds: dict[str, float],
     batch_token_budget: int,
     boundaries: list[int],
@@ -172,6 +209,7 @@ def evaluate_reader_binding(
                 rng=rng,
                 mod_unlabeled_ratio=1.0,
                 mask_prob=0.15,
+                use_rnafold_struct_feats=use_rnafold_struct_feats,
             )
             batch = to_device(batch, device)
 
@@ -189,6 +227,7 @@ def evaluate_reader_binding(
                 struct_feats=batch["struct_feats"],
                 site_positions=batch["site_positions"],
                 site_mask=batch["site_mask"],
+                compute_struct=False,
             )
 
             # 只统计有效 site（site_mask=True），跳过 padding 槽位。
@@ -278,19 +317,32 @@ def _prepare_data_and_priors(cfg: dict):
     )
 
     t2 = time.perf_counter()
-    if str(cfg.get("struct_source", "precomputed")) == "online":
+    if bool(cfg.get("ablate_no_struct", False)):
+        # 结构任务消融时，不再初始化任何 RNAfold provider。
+        # 后续 collate_batch 会显式关闭 use_rnafold_struct_feats，从而不触发结构统计计算。
+        struct_provider = None
+        print(
+            f"[data] struct provider skipped: ablate_no_struct=True elapsed={time.perf_counter() - t2:.2f}s",
+            flush=True,
+        )
+    elif str(cfg.get("struct_source", "precomputed")) == "online":
         struct_provider = OnlineRNAfoldProvider(
             rnafold_bin=str(cfg.get("online_rnafold_bin", "RNAfold")),
             timeout_seconds=int(cfg.get("online_rnafold_timeout_seconds", 240)),
             cache_size=int(cfg.get("online_rnafold_cache_size", 2048)),
         )
+        print(
+            f"[data] struct provider ready: source={cfg.get('struct_source', 'precomputed')} "
+            f"elapsed={time.perf_counter() - t2:.2f}s",
+            flush=True,
+        )
     else:
         struct_provider = BPPCache(cfg["rnafold_cache"])
-    print(
-        f"[data] struct provider ready: source={cfg.get('struct_source', 'precomputed')} "
-        f"elapsed={time.perf_counter() - t2:.2f}s",
-        flush=True,
-    )
+        print(
+            f"[data] struct provider ready: source={cfg.get('struct_source', 'precomputed')} "
+            f"elapsed={time.perf_counter() - t2:.2f}s",
+            flush=True,
+        )
     t3 = time.perf_counter()
     mod_prior = estimate_mod_prior(train_examples)
     bind_priors = estimate_binding_priors(train_examples)
@@ -392,6 +444,7 @@ def _run_train_epoch(
     """
     batch_log_interval = int(cfg.get("batch_log_interval", 10))
     batch_log_interval = max(1, batch_log_interval)
+    amp_enabled = bool(use_amp and device.type == "cuda")
 
     model.train()
     t_build_batches = time.perf_counter()
@@ -457,6 +510,7 @@ def _run_train_epoch(
             aprime_enable=bool(cfg["aprime_enable"]),
             aprime_prob=float(cfg["aprime_prob"]),
             aprime_max_per_seq=int(cfg["aprime_max_per_seq"]),
+            use_rnafold_struct_feats=not bool(cfg.get("ablate_no_struct", False)),
         )
         collate_elapsed = time.perf_counter() - t_collate
         batch = to_device(batch, device)
@@ -489,6 +543,7 @@ def _run_train_epoch(
                 struct_feats=batch["struct_feats"],
                 site_positions=batch["site_positions"],
                 site_mask=batch["site_mask"],
+                compute_struct=not bool(cfg.get("ablate_no_struct", False)),
             )
 
             losses = compute_multitask_losses(
@@ -515,15 +570,22 @@ def _run_train_epoch(
         loss_for_step = loss_total / int(cfg["grad_accum"])
         if not loss_for_step.requires_grad:
             loss_for_step = loss_for_step + 0.0 * outputs["mod_logits_acu"].sum()
-        scaler.scale(loss_for_step).backward()
+        if amp_enabled:
+            scaler.scale(loss_for_step).backward()
+        else:
+            loss_for_step.backward()
 
         did_optim_step = False
         if (batch_idx % int(cfg["grad_accum"]) == 0) or (batch_idx == len(batches)):
             # 优化前先反缩放并做梯度裁剪，抑制异常梯度。
-            scaler.unscale_(optimizer)
+            if amp_enabled:
+                scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(cfg["grad_clip"]))
-            scaler.step(optimizer)
-            scaler.update()
+            if amp_enabled:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
             optim_step += 1
@@ -585,10 +647,19 @@ def main() -> None:
     set_seed(int(cfg["seed"]))
     use_amp = bool(cfg["use_amp"])
     device = torch.device(cfg["device"])
+    if bool(cfg.get("disable_cudnn", False)):
+        torch.backends.cudnn.enabled = False
+        print("[runtime] cuDNN disabled by config (disable_cudnn=True)", flush=True)
     boundaries = list(cfg["bucket_boundaries_list"])
+    out_dir = Path(cfg["output_dir"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _setup_train_log_file(out_dir)
 
     train_examples, val_examples, struct_provider, mod_prior, bind_priors, strong_thresholds = _prepare_data_and_priors(cfg)
-    print(f"Structure source: {cfg.get('struct_source', 'precomputed')}")
+    if bool(cfg.get("ablate_no_struct", False)):
+        print("Structure source: disabled (ablate_no_struct=True)")
+    else:
+        print(f"Structure source: {cfg.get('struct_source', 'precomputed')}")
     (
         model,
         mod_pu_loss,
@@ -609,8 +680,6 @@ def main() -> None:
     )
 
     # 输出目录统一管理：checkpoint、metrics、run_config、TensorBoard。
-    out_dir = Path(cfg["output_dir"])
-    out_dir.mkdir(parents=True, exist_ok=True)
     writer = None
     if bool(cfg["tensorboard"]):
         try:
@@ -648,6 +717,8 @@ def main() -> None:
     optim_step = 0
 
     for epoch in range(1, int(cfg["epochs"]) + 1):
+        epoch_t0 = time.perf_counter()
+        train_t0 = time.perf_counter()
         agg, global_step, optim_step = _run_train_epoch(
             epoch=epoch,
             model=model,
@@ -669,17 +740,21 @@ def main() -> None:
             global_step=global_step,
             optim_step=optim_step,
         )
+        train_elapsed = time.perf_counter() - train_t0
 
         # 每个 epoch 后做 reader 验证，作为 best 模型选择依据。
+        val_t0 = time.perf_counter()
         val_metrics = evaluate_reader_binding(
             model=model,
             examples=val_examples,
             struct_provider=struct_provider,
+            use_rnafold_struct_feats=not bool(cfg.get("ablate_no_struct", False)),
             strong_thresholds=strong_thresholds,
             batch_token_budget=int(cfg["batch_token_budget"]),
             boundaries=boundaries,
             device=device,
         )
+        val_elapsed = time.perf_counter() - val_t0
 
         # 记录 epoch 结果快照。
         epoch_record = {
@@ -708,12 +783,24 @@ def main() -> None:
             writer.add_scalar("val/reader_unc_gap", val_metrics["reader_unc_gap"], epoch)
             writer.add_scalar("train/lr_epoch", optimizer.param_groups[0]["lr"], epoch)
 
-        # 终端打印一行摘要，便于实时监控。
+        epoch_elapsed = time.perf_counter() - epoch_t0
+        # 终端打印摘要，便于实时监控。
         print(
             f"Epoch {epoch:03d} | "
             f"loss={agg['loss_total']:.4f} bind={agg['loss_bind']:.4f} mod={agg['loss_mod']:.4f} "
             f"struct={agg['loss_struct']:.4f} mlm={agg['loss_mlm']:.4f} unc={agg['loss_unc']:.4f} dir={agg['loss_dir']:.4f} "
-            f"val_reader_auprc={val_metrics['reader_auprc']:.4f} val_reader_auroc={val_metrics['reader_auroc']:.4f}"
+            f"val_reader_auprc={val_metrics['reader_auprc']:.4f} val_reader_auroc={val_metrics['reader_auroc']:.4f} "
+            f"val_reader_f1={val_metrics['reader_f1']:.4f} val_reader_ece={val_metrics['reader_ece']:.4f}"
+        )
+        print(
+            f"Epoch {epoch:03d} details | "
+            f"steps={int(agg['steps'])} optim_step={optim_step} global_step={global_step} "
+            f"lr={optimizer.param_groups[0]['lr']:.6e} "
+            f"train_time={train_elapsed:.1f}s val_time={val_elapsed:.1f}s epoch_time={epoch_elapsed:.1f}s "
+            f"val_unc_strong={val_metrics['reader_unc_strong']:.4f} "
+            f"val_unc_weak={val_metrics['reader_unc_weak']:.4f} val_unc_gap={val_metrics['reader_unc_gap']:.4f} "
+            f"best_epoch={best['epoch']} best_auprc={best['reader_auprc']:.4f}",
+            flush=True,
         )
 
         # 保存每个 epoch 的完整 checkpoint（含优化器与调度器状态）。

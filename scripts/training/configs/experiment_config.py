@@ -29,10 +29,11 @@ def _builtin_preset(name: str) -> dict:
     """
     if name == "default":
         return {}
-    if name == "smoke_gpu":
+    if name == "smoke_gpu": # /root/miniconda3/envs/m6a/bin/python scripts/training/train_etd_multitask.py --preset smoke_gpu
+
         return {
-            "epochs": 1,
-            "smoke_ratio": 0.005,
+            "epochs": 6,
+            "smoke_ratio": 0.5,
             "batch_token_budget": 4096,
             "max_len": 2000,
             "device": "cuda",
@@ -42,6 +43,9 @@ def _builtin_preset(name: str) -> dict:
             "batch_log_interval": 1,
             "output_dir": "outputs/etd_multitask/smoke_run_gpu_online_0005",
             "tensorboard": False,
+            "disable_cudnn": True,
+            "ablate_no_struct": True,
+            "loss_w_struct": 0.0,
         }
     raise ValueError(f"Unknown preset: {name}")
 
@@ -77,6 +81,11 @@ def build_train_arg_parser(repo_root: Path) -> argparse.ArgumentParser:
     parser.add_argument("--transcripts", default=str(repo_root / "data/processed/m6a_multitask_transcripts.parquet"))
     parser.add_argument("--splits", default=str(repo_root / "data/processed/m6a_multitask_splits.json"))
     parser.add_argument("--rnafold-cache", default=str(repo_root / "data/processed/rnafold_bpp"))
+    parser.add_argument(
+        "--rnafold-single-site-cache",
+        default=str(repo_root / "data/processed/rnafold_single_site_dense"),
+        help="Reserved path for offline single-site replacement RNAfold dense cache.",
+    )
     parser.add_argument("--max-len", type=int, default=12000)
     parser.add_argument("--smoke-ratio", type=float, default=1.0)
     parser.add_argument("--batch-token-budget", type=int, default=24000)
@@ -100,7 +109,7 @@ def build_train_arg_parser(repo_root: Path) -> argparse.ArgumentParser:
         dest="aprime_enable",
         default=True,
     )
-    parser.add_argument("--aprime-prob", type=float, dest="aprime_prob", default=0.1)
+    parser.add_argument("--aprime-prob", type=float, dest="aprime_prob", default=0.7)
     parser.add_argument("--aprime-max-per-seq", type=int, dest="aprime_max_per_seq", default=-1)
 
     parser.add_argument(
@@ -141,6 +150,13 @@ def build_train_arg_parser(repo_root: Path) -> argparse.ArgumentParser:
     # ---- 运行时与日志 ----
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--disable-cudnn",
+        action=argparse.BooleanOptionalAction,
+        dest="disable_cudnn",
+        default=False,
+        help="Disable cuDNN kernels (useful to avoid rare illegal-memory issues on some CUDA stacks).",
+    )
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--tensorboard", action="store_true")

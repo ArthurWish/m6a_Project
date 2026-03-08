@@ -85,7 +85,8 @@ def dirichlet_binary_nll(alpha: torch.Tensor, labels: torch.Tensor, mask: torch.
         return alpha.new_tensor(0.0)
 
     # 仅保留有效位置。
-    alpha = alpha[mask]
+    # 在 AMP 下，digamma/特殊函数对 fp16 不稳定，统一转 float32 计算更稳。
+    alpha = alpha[mask].float()
     labels = labels[mask].long()
 
     # E[-log p(y)] = digamma(sum(alpha)) - digamma(alpha_y)
@@ -119,7 +120,8 @@ def evidential_positive_loss(
         return alpha.new_tensor(0.0)
 
     # 仅取正样本位置。
-    alpha_pos = alpha[positive_mask]
+    # 在 AMP 下证据项建议用 float32，避免极小值/梯度不稳。
+    alpha_pos = alpha[positive_mask].float()
     # Dirichlet 期望概率（正类 index=1）。
     pos_prob = alpha_pos[..., 1] / alpha_pos.sum(dim=-1).clamp_min(1e-8)
     # 证据强度（alpha 总和）。
@@ -198,13 +200,13 @@ def grouped_binding_loss(
     """按 G1~G5 分组规则构建 bind 任务损失。
 
     分组语义（由 collate_batch 提供 mask）：
-    - G1: m6A + A' + role=1   -> 高概率、低不确定度、正例证据增强
-    - G2: m6A + A' + role=-1  -> PU 的 unlabeled 端
+    - G1: m6A + A' + role=1   -> 低不确定度、正例证据增强
+    - G2: m6A + A' + role=-1  -> 参与 PU 主损失（在 composer 中统一计算）
     - G3: m6A + A  + role=1   -> 负向约束（不应高概率）
     - G5: 非 m6A 的 A         -> 低概率 + 高不确定度锚定
 
     返回值字段：
-    - core: 主监督项（G1/G2/G3/G5 的概率约束）
+    - core: 分组附加项（G3/G5 的概率约束）
     - dir:  证据项（G1）
     - unc:  不确定度项（G1/G5）
     """
@@ -214,16 +216,12 @@ def grouped_binding_loss(
 
     probs = torch.sigmoid(logits)
 
-    # G1: 正样本核心监督（希望 logit 高）。
-    loss_g1_pos = F.softplus(-logits[g1_mask]).mean() if g1_mask.any() else _zero()
-    # G2: unlabeled 端（与 PU 的 U 风险方向一致）。
-    loss_g2_unl = F.softplus(logits[g2_mask]).mean() if g2_mask.any() else _zero()
     # G3: 负向约束，抑制未 reveal 的正位点出现过高结合概率。
     loss_g3 = F.relu(probs[g3_mask] - g3_prob_max).mean() if g3_mask.any() else _zero()
     # G5: 普通 A 锚点，概率不应高。
     loss_g5_prob = F.relu(probs[g5_mask] - g5_prob_max).mean() if g5_mask.any() else _zero()
 
-    core = loss_g1_pos + loss_g2_unl + loss_g3 + loss_g5_prob
+    core = loss_g3 + loss_g5_prob
 
     # G1 evidential 正例项：鼓励正类证据与强度。
     loss_dir = evidential_positive_loss(alpha, positive_mask=g1_mask)

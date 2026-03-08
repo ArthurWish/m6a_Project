@@ -103,20 +103,36 @@ def compute_multitask_losses(
         bind_probs = torch.sigmoid(outputs["bind_logits"])
         if args.bind_grouped_loss:
             # G1~G5 分组损失：更细粒度地控制 reveal/unlabeled/普通A 行为。
+            g1_mask = batch["g1_mask"] & batch["site_mask"]
+            g2_mask = batch["g2_mask"] & batch["site_mask"]
+            g3_mask = batch["g3_mask"] & batch["site_mask"]
+            g5_mask = batch["g5_mask"] & batch["site_mask"]
+
+            # G1/G2 使用与 legacy 一致的同一套 nnPU 主损失。
+            pu_mask = g1_mask | g2_mask
+            pu_labels = torch.zeros_like(batch["site_pu_labels"])
+            pu_labels = torch.where(g1_mask, torch.ones_like(pu_labels), pu_labels)
+            pu_labels = torch.where(g2_mask, -torch.ones_like(pu_labels), pu_labels)
+            loss_bind = bind_pu_loss[sampled_role](
+                logits=outputs["bind_logits"],
+                labels=pu_labels,
+                mask=pu_mask,
+            )
+
             grouped = grouped_binding_loss(
                 logits=outputs["bind_logits"],
                 alpha=outputs["bind_alpha"],
                 uncertainty=outputs["bind_uncertainty"],
-                g1_mask=batch["g1_mask"] & batch["site_mask"],
-                g2_mask=batch["g2_mask"] & batch["site_mask"],
-                g3_mask=batch["g3_mask"] & batch["site_mask"],
-                g5_mask=batch["g5_mask"] & batch["site_mask"],
+                g1_mask=g1_mask,
+                g2_mask=g2_mask,
+                g3_mask=g3_mask,
+                g5_mask=g5_mask,
                 g3_prob_max=args.bind_g3_prob_max,
                 g5_prob_max=args.bind_g5_prob_max,
                 g5_unc_min=args.bind_g5_unc_min,
                 g1_unc_max=args.bind_g1_unc_max,
             )
-            loss_bind = grouped["core"]
+            loss_bind = loss_bind + grouped["core"]
             if not args.ablate_no_dirichlet:
                 loss_dir = grouped["dir"]
             loss_unc = grouped["unc"]
@@ -166,11 +182,25 @@ def compute_multitask_losses(
     # ---- mask 任务 ----
     # 经典 MLM 交叉熵；ignore_index 位置不参与损失。
     elif task_name == "mask":
-        loss_mlm = F.cross_entropy(
-            outputs["mask_logits"].reshape(-1, 4),
-            batch["mlm_target"].reshape(-1),
-            ignore_index=-100,
-        )
+        # AMP 下将 MLM CE 显式放到 float32，避免半精度数值/内核不稳定。
+        mlm_logits = outputs["mask_logits"].float().reshape(-1, 4)
+        mlm_target = batch["mlm_target"].reshape(-1).long()
+
+        valid = mlm_target != -100
+        if valid.any():
+            t_valid = mlm_target[valid]
+            tmin = int(t_valid.min().item())
+            tmax = int(t_valid.max().item())
+            if tmin < 0 or tmax > 3:
+                raise RuntimeError(f"MLM target out of range: min={tmin}, max={tmax}, expect in [0,3]")
+            loss_mlm = F.cross_entropy(
+                mlm_logits,
+                mlm_target,
+                ignore_index=-100,
+            )
+        else:
+            # 当前 batch 无 MLM 监督位点，返回 0，避免 CE 在全 ignore 情况下产生 NaN。
+            loss_mlm = mlm_logits.new_tensor(0.0)
 
     # ---- 总损失加权 ----
     # 保持与原训练脚本一致的系数，便于行为对齐与历史结果可比。

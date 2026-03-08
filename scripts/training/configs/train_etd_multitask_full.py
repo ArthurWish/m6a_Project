@@ -23,6 +23,8 @@ CONFIG = {
     "splits": "data/processed/m6a_multitask_splits.json",
     # RNAfold 稀疏 BPP 缓存目录
     "rnafold_cache": "data/processed/rnafold_bpp",
+    # 预留：单位点替换(A->6)离线 RNAfold 稠密缓存目录（当前训练尚未接入）
+    "rnafold_single_site_cache": "data/processed/rnafold_single_site_dense",
     # 训练允许的最大序列长度（超出会在加载阶段过滤）
     "max_len": 12000,
     # smoke 联调用采样比例；1.0 表示全量
