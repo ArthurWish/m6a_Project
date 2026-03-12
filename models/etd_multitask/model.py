@@ -18,14 +18,14 @@ class ETDMultiTaskModel(nn.Module):
 
         self.base_embed = nn.Embedding(VOCAB_SIZE, 32)
         self.pos_embed = nn.Embedding(12000, 32)#长度上限 12000，到 32 维
-        self.struct_proj = nn.Linear(8, 32)#结构局部特征
-        self.input_proj = nn.Linear(96, 256)#投影到 d_model=256
+        self.input_proj = nn.Linear(64, 256)#投影到 d_model=256
         self.input_norm = nn.LayerNorm(256)
 
         self.condition = ConditionEncoder(
             task_vocab=4,
             role_vocab=4,
             base_vocab=5,
+            mod_type_vocab=5,
             embed_dim=64,
             bottleneck_dim=512,
             pair_dim=128,
@@ -53,8 +53,8 @@ class ETDMultiTaskModel(nn.Module):
         cond_task: torch.Tensor,
         cond_role: torch.Tensor,
         cond_base: torch.Tensor,
+        cond_mod_type: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
-        struct_feats: torch.Tensor | None = None,
         site_positions: torch.Tensor | None = None,
         site_mask: torch.Tensor | None = None,
         compute_struct: bool = True,
@@ -68,14 +68,12 @@ class ETDMultiTaskModel(nn.Module):
         pos_ids = torch.arange(length, device=device).clamp(max=11999)
         pos_emb = self.pos_embed(pos_ids).unsqueeze(0).expand(bsz, -1, -1)
 
-        if struct_feats is None:
-            struct_feats = torch.zeros(bsz, length, 8, device=device, dtype=torch.float32)
+
 
         x = torch.cat(
             [
                 self.base_embed(tokens), #[bs, L, 32]
                 pos_emb,                   #[bs, L, 32]
-                self.struct_proj(struct_feats), #[bs, L, 32]
             ],
             dim=-1,
         )
@@ -84,10 +82,11 @@ class ETDMultiTaskModel(nn.Module):
         down_mask = downsample_mask(attn_mask, factor=16)#序列主干 mask 下采样 [B, ceil(L/16)]
         pair_mask = downsample_mask(attn_mask, factor=32)#pair 分支 mask 下采样 [B, ceil(L/32)]
 
-        struct_down_pair = downsample_1d(struct_feats, factor=32, mask=attn_mask) #[B, ceil(L/32),8]
+        struct_init = torch.zeros(bsz, length, 8, device=device, dtype=torch.float32)
+        struct_down_pair = downsample_1d(struct_init, factor=32, mask=attn_mask) #[B, ceil(L/32),8]
         pair_feats = make_pair_features(struct_down_pair, pair_mask)
 
-        cond = self.condition(cond_task, cond_role, cond_base)
+        cond = self.condition(cond_task, cond_role, cond_base, cond_mod_type)
         backbone_out = self.backbone(
             x=x,
             pair_feats=pair_feats,

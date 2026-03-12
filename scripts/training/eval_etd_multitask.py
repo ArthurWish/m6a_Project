@@ -140,7 +140,6 @@ def evaluate_binding(
                 cond_role=cond_role,
                 cond_base=cond_base,
                 attn_mask=batch["attn_mask"],
-                struct_feats=batch["struct_feats"],
                 site_positions=batch["site_positions"],
                 site_mask=batch["site_mask"],
             )
@@ -238,7 +237,6 @@ def evaluate_mod(
                 cond_role=cond_role,
                 cond_base=cond_base,
                 attn_mask=batch["attn_mask"],
-                struct_feats=batch["struct_feats"],
                 site_positions=batch["site_positions"],
                 site_mask=batch["site_mask"],
             )
@@ -314,7 +312,6 @@ def evaluate_structure(
                 cond_role=cond_role,
                 cond_base=cond_base,
                 attn_mask=batch["attn_mask"],
-                struct_feats=batch["struct_feats"],
                 site_positions=batch["site_positions"],
                 site_mask=batch["site_mask"],
             )
@@ -382,7 +379,6 @@ def evaluate_mask(
                 cond_role=cond_role,
                 cond_base=cond_base,
                 attn_mask=batch["attn_mask"],
-                struct_feats=batch["struct_feats"],
                 site_positions=batch["site_positions"],
                 site_mask=batch["site_mask"],
             )

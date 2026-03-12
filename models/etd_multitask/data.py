@@ -4,38 +4,49 @@ from __future__ import annotations
 import json
 import math
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 import numpy as np
 import pandas as pd
 import torch
-from .constants import BASE_TO_ID, MASK_TOKEN_ID, PAD_TOKEN_ID, ROLE_NAMES, VALID_BASES
+from .constants import BASE_TO_ID, MASK_TOKEN_ID, MOD_BASE_MAP, PAD_TOKEN_ID, ROLE_NAMES, VALID_BASES, MOD_TYPE_NAMES, TASK_PROBS
 from .aprime import encode_with_optional_aprime
 from .utils import parse_list_field
 
 
 @dataclass
 class TranscriptExample:
-    """单条转录本训练样本的内存结构。
+    """单条转录本训练样本的内存结构（多修饰泛化版）。
 
     字段说明：
     - transcript_id: 转录本 ID（如 ENST...）
-    - sequence: RNA 序列（通常已标准化为 A/C/G/U）
+    - sequence: RNA 序列（已标准化为 A/C/G/U）
     - seq_len: 序列长度
-    - m6a_positions: 已知 m6A 位点位置（1D ndarray，0-based）
-    - unlabeled_a_positions: 未标注的 A 位点（PU 学习中的 unlabeled 候选）
-    - role_labels: 各 role 的 PU 标签数组（1=positive, -1=unlabeled）
-    - role_support: 各 role 的支持证据计数（与 role_labels 按位对齐）
+
+    - mod_positions: {mod_type -> positions ndarray}
+      每种修饰类型的已知位点（0-based），如 {"m6A": [100,200], "m5C": [400]}
+
+    - unlabeled_positions: {mod_type -> positions ndarray}
+      每种修饰对应碱基中未标注的候选位点（PU unlabeled 集）
+      如 {"m6A": [非m6A的A位点], "m5C": [非m5C的C位点], ...}
+
+    - role_labels: {mod_type -> {role -> labels ndarray}}
+      按修饰类型和 role 分组的 PU 标签，与 mod_positions[mod_type] 对齐
+
+    - role_support: {mod_type -> {role -> support ndarray}}
+      同上结构，证据支持计数
+
+    - all_mod_positions: 所有修饰位点的并集
     """
     transcript_id: str
     sequence: str
     seq_len: int
-    m6a_positions: np.ndarray
-    unlabeled_a_positions: np.ndarray
-    role_labels: dict[str, np.ndarray]
-    role_support: dict[str, np.ndarray]
-
+    mod_positions: dict[str, np.ndarray] = field(default_factory=dict)
+    unlabeled_positions: dict[str, np.ndarray] = field(default_factory=dict)
+    role_labels: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
+    role_support: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
+    all_mod_positions: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int64))
 
 class BPPCache:
     """读取并缓存 RNAfold 生成的稀疏配对概率。
@@ -175,7 +186,7 @@ def _build_site_lookup(sites_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
 
     细节：
     - 先计算 support_sum 作为重复位点的优先级
-    - 同一 transcript_id + site_pos 若重复，保留 support_sum 更高的一条
+    - 同一 transcript_id + site_pos + mod_type 若重复，保留 support_sum 更高的一条
     - 最终每个 transcript 子表按 site_pos 升序
     """
     sites_df = sites_df.copy()
@@ -185,10 +196,10 @@ def _build_site_lookup(sites_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
         + sites_df["eraser_support_count"].astype(float)
     )
     sites_df = sites_df.sort_values(
-        ["transcript_id", "site_pos", "support_sum"],
-        ascending=[True, True, False],
+        ["transcript_id", "site_pos", "mod_type", "support_sum"],
+        ascending=[True, True, True, False],
     )
-    sites_df = sites_df.drop_duplicates(subset=["transcript_id", "site_pos"], keep="first")
+    sites_df = sites_df.drop_duplicates(subset=["transcript_id", "site_pos", "mod_type"], keep="first")
 
     out: dict[str, pd.DataFrame] = {}
     for transcript_id, group in sites_df.groupby("transcript_id"):
@@ -222,7 +233,7 @@ def load_examples(
     处理步骤：
     1) 读取位点表与转录本表
     2) 依据 split_names 过滤 transcript
-    3) 构建 m6A 位点、unlabeled A 位点、role 标签与支持计数
+    3) 按 mod_type 分组，构建修饰位点、unlabeled 候选、role 标签与支持计数
     4) 组装为 TranscriptExample
     5) 可选 smoke 子采样
     """
@@ -248,35 +259,88 @@ def load_examples(
         site_df = site_lookup.get(transcript_id)
         if site_df is None or site_df.empty:
             continue
+        
+        mod_positions: dict[str, np.ndarray] = {}
+        role_labels: dict[str, dict[str, np.ndarray]] = {}
+        role_support: dict[str, dict[str, np.ndarray]] = {}
 
-        m6a_positions = site_df["site_pos"].astype(int).to_numpy(dtype=np.int64)
-        m6a_positions = np.unique(m6a_positions)
+        for mod_type, mod_group in site_df.groupby("mod_type"):
+            mod_type = str(mod_type)
+            if mod_type not in MOD_BASE_MAP:
+                continue
+            positions = np.unique(mod_group["site_pos"].astype(int).to_numpy(dtype=np.int64))
+            mod_positions[mod_type] = positions
 
-        # unlabeled A = 全序列 A 位点 - 已知 m6A 位点。
-        m6a_set = set(int(x) for x in m6a_positions.tolist())
-        unlabeled_a = [idx for idx, base in enumerate(seq) if base == "A" and idx not in m6a_set]
-
-        role_labels = {
-            "writer": site_df["writer_pu_label"].astype(int).to_numpy(dtype=np.int64),
-            "reader": site_df["reader_pu_label"].astype(int).to_numpy(dtype=np.int64),
-            "eraser": site_df["eraser_pu_label"].astype(int).to_numpy(dtype=np.int64),
-        }
-        role_support = {
-            "writer": site_df["writer_support_count"].astype(int).to_numpy(dtype=np.int64),
-            "reader": site_df["reader_support_count"].astype(int).to_numpy(dtype=np.int64),
-            "eraser": site_df["eraser_support_count"].astype(int).to_numpy(dtype=np.int64),
-        }
+            role_labels[mod_type] = {
+                "writer": mod_group["writer_pu_label"].astype(int).to_numpy(dtype=np.int64),
+                "reader": mod_group["reader_pu_label"].astype(int).to_numpy(dtype=np.int64),
+                "eraser": mod_group["eraser_pu_label"].astype(int).to_numpy(dtype=np.int64),
+            }
+            role_support[mod_type] = {
+                "writer": mod_group["writer_support_count"].astype(int).to_numpy(dtype=np.int64),
+                "reader": mod_group["reader_support_count"].astype(int).to_numpy(dtype=np.int64),
+                "eraser": mod_group["eraser_support_count"].astype(int).to_numpy(dtype=np.int64),
+            }
+        if not mod_positions:
+            continue
+        
+        base_all_positions: dict[str, list[int]] = {}
+        for idx, base in enumerate(seq):
+            if base in ("A", "C", "G", "U"):
+                base_all_positions.setdefault(base, []).append(idx)
+        unlabeled_positions: dict[str, np.ndarray] = {}
+        for mt, positions in mod_positions.items():
+            target_base = MOD_BASE_MAP[mt]
+            all_pos_of_base = base_all_positions.get(target_base, [])
+            own_positive_set = set(int(x) for x in positions.tolist())
+            unl = [p for p in all_pos_of_base if p not in own_positive_set]
+            unlabeled_positions[mt] = np.asarray(unl, dtype=np.int64)
+        
+        all_pos_list = []
+        for positions in mod_positions.values():
+            all_pos_list.append(positions)
+        all_mod_positions = np.unique(np.concatenate(all_pos_list)) if all_pos_list else np.zeros(0, dtype=np.int64)
 
         example = TranscriptExample(
             transcript_id=transcript_id,
             sequence=seq,
             seq_len=seq_len,
-            m6a_positions=m6a_positions,
-            unlabeled_a_positions=np.asarray(unlabeled_a, dtype=np.int64),
+            mod_positions=mod_positions,
+            unlabeled_positions=unlabeled_positions,
             role_labels=role_labels,
             role_support=role_support,
+            all_mod_positions=all_mod_positions,
         )
         examples.append(example)
+
+    #     m6a_positions = site_df["site_pos"].astype(int).to_numpy(dtype=np.int64)
+    #     m6a_positions = np.unique(m6a_positions)
+
+    #     # unlabeled A = 全序列 A 位点 - 已知 m6A 位点。
+    #     m6a_set = set(int(x) for x in m6a_positions.tolist())
+    #     unlabeled_a = [idx for idx, base in enumerate(seq) if base == "A" and idx not in m6a_set]
+
+    #     role_labels = {
+    #         "writer": site_df["writer_pu_label"].astype(int).to_numpy(dtype=np.int64),
+    #         "reader": site_df["reader_pu_label"].astype(int).to_numpy(dtype=np.int64),
+    #         "eraser": site_df["eraser_pu_label"].astype(int).to_numpy(dtype=np.int64),
+    #     }
+    #     role_support = {
+    #         "writer": site_df["writer_support_count"].astype(int).to_numpy(dtype=np.int64),
+    #         "reader": site_df["reader_support_count"].astype(int).to_numpy(dtype=np.int64),
+    #         "eraser": site_df["eraser_support_count"].astype(int).to_numpy(dtype=np.int64),
+    #     }
+
+    #     example = TranscriptExample(
+    #         transcript_id=transcript_id,
+    #         sequence=seq,
+    #         seq_len=seq_len,
+    #         m6a_positions=m6a_positions,
+    #         unlabeled_a_positions=np.asarray(unlabeled_a, dtype=np.int64),
+    #         role_labels=role_labels,
+    #         role_support=role_support,
+    #     )
+    #     examples.append(example)
 
     # smoke_ratio<1 时做随机子集抽样，加速联调。
     examples = _sample_examples(examples, smoke_ratio=smoke_ratio, seed=seed)
@@ -340,89 +404,79 @@ def build_length_bucketed_batches(
     return batches
 
 
+
+def sample_task_name(rng: random.Random, task_probs: dict[str, float] | None = None) -> str:
+    """按给定概率采样任务名。"""
+    if task_probs is None:
+        task_probs = TASK_PROBS
+
+    tasks = list(task_probs.keys())
+    probs = list(task_probs.values())
+
+    s = sum(probs)
+    if s <= 0:
+        raise ValueError("task_probs 的概率和必须大于 0")
+
+    probs = [p / s for p in probs]
+    return rng.choices(tasks, weights=probs, k=1)[0]
+
 def sample_task_condition(task_name: str, rng: random.Random) -> tuple[str, str]:
-    """按任务采样一组条件 token（role/base）。
-
-    设计目的：
-    - 训练时给模型喂入条件向量（`cond_task/cond_role/cond_base`），
-      让同一模型在不同任务上下文里学习。
-    - 这里仅负责“原始采样”，不做随机遮蔽（mask）；遮蔽由 `apply_condition_mask` 处理。
-
+    """
+    按任务采样一组条件 token（role / base / mod_type）
     采样规则：
-    - bind: role 从 {writer, reader, eraser} 均匀采样；base 从 {A,C,G,U} 均匀采样
-    - mod:  role 固定为 "none"；base 从 {A,C,U} 采样（保持历史训练约定）
-    - struct: role 固定为 "none"；base 从 {A,C,G,U} 采样
-    - mask: role 固定为 "none"；base 固定为 "mask"
+    - bind: mod_type 从 4 种均匀采样 → base 由 mod_type 决定；role 均匀采样
+    - mod:  mod_type 从 4 种均匀采样 → base 由 mod_type 决定；role="none"
+    - struct: mod_type="none"；role="none"；base 从 ACGU 采样
+    - mask:   mod_type="none"；role="none"；base="mask"
     """
     if task_name == "bind":
         role = rng.choice(list(ROLE_NAMES))
-        base = rng.choice(list(VALID_BASES))
-        return role, base
+        mod_type = rng.choice(list(MOD_TYPE_NAMES))
+        base = MOD_BASE_MAP[mod_type]
+        return role, base, mod_type
     if task_name == "mod":
-        return "none", rng.choice(["A", "C", "U"])
+        mod_type = rng.choice(list(MOD_TYPE_NAMES))
+        base = MOD_BASE_MAP[mod_type]
+        return "none", base, mod_type
     if task_name == "struct":
-        return "none", rng.choice(list(VALID_BASES))
-    return "none", "mask"
+        return "none", rng.choice(list(VALID_BASES)), "none"
+    return "none", "mask", "none"
 
 def apply_condition_mask(
     task_name: str,
     sampled_role: str,
     sampled_base: str,
+    sampled_mod_type: str,
     rng: random.Random,
     role_mask_prob: float,
     base_mask_prob: float,
+    mod_type_mask_prob: float,
 ) -> tuple[str, str]:
-    """对采样条件做随机遮蔽，得到真正送入模型的 cond_role/cond_base。
+    """对采样条件做随机遮蔽，得到真正送入模型的 cond_role/cond_base/cond_mod_type。
 
     语义：
     - role 被遮蔽时置为 "none"
     - base 被遮蔽时置为 "mask"
+    - mod_type 被遮蔽时置为 "none"
 
     边界约束：
     - 仅对 bind/mod/struct 三类任务生效。
-    - mask 任务保持固定条件（none, mask），不再二次随机化。
+    - mask 任务保持固定条件,不再二次随机化。
     """
     cond_role = sampled_role
     cond_base = sampled_base
+    cond_mod_type = sampled_mod_type
+
     if task_name in ("bind", "mod", "struct"):
         if rng.random() < role_mask_prob:
             cond_role = "none"
         if rng.random() < base_mask_prob:
             cond_base = "mask"
-    return cond_role, cond_base
+        if rng.random() < mod_type_mask_prob:
+            cond_mod_type = "none"
+    return cond_role, cond_base, cond_mod_type
 
-def _build_struct_features(
-    seq_ids: np.ndarray,
-    m6a_positions: np.ndarray,
-    pair_prob: np.ndarray,
-    pair_count: np.ndarray,
-) -> np.ndarray:
-    """构造每个位点 8 维结构/序列特征。
 
-    维度定义：
-    0: 配对概率和（clip 后）
-    1: 配对计数（按长度归一化后 clip）
-    2: 是否为已知 m6A 位点
-    3-6: A/C/G/U one-hot
-    7: 相对位置（0~1）
-    """
-    length = int(seq_ids.shape[0])
-    out = np.zeros((length, 8), dtype=np.float32)
-
-    out[:, 0] = np.clip(pair_prob, 0.0, 1.0)
-    out[:, 1] = np.clip(pair_count / max(1.0, length / 2.0), 0.0, 1.0)
-
-    if m6a_positions.size > 0:
-        out[m6a_positions, 2] = 1.0
-
-    out[:, 3] = (seq_ids == BASE_TO_ID["A"]).astype(np.float32)
-    out[:, 4] = (seq_ids == BASE_TO_ID["C"]).astype(np.float32)
-    out[:, 5] = (seq_ids == BASE_TO_ID["G"]).astype(np.float32)
-    out[:, 6] = (seq_ids == BASE_TO_ID["U"]).astype(np.float32)
-
-    if length > 1:
-        out[:, 7] = np.arange(length, dtype=np.float32) / float(length - 1)
-    return out
 
 def tensor_to_numpy_flat(tensor: torch.Tensor, mask: torch.Tensor | None = None) -> np.ndarray:
     """张量转 numpy 并展平；可选按 mask 过滤有效位置。"""
@@ -434,10 +488,6 @@ def tensor_to_numpy_flat(tensor: torch.Tensor, mask: torch.Tensor | None = None)
 
 def _spawn_row_rngs(rng: random.Random) -> tuple[random.Random, random.Random]:
     """为单条样本拆分独立随机源。
-
-    返回：
-    - rng_aprime: 仅用于 A' 替换
-    - rng_unlabeled: 仅用于未标注位点采样（mod / G5）
     """
     row_seed_aprime = rng.randint(0, 2**31 - 1)
     row_seed_unlabeled = rng.randint(0, 2**31 - 1)
@@ -474,53 +524,98 @@ def read_parquet_list_column(df: pd.DataFrame, column: str) -> pd.Series:
     return df[column].apply(parse_list_field)
 
 ################ 先验比例相关
-def estimate_mod_prior(examples: list[TranscriptExample]) -> float:
+def estimate_mod_prior(examples: list[TranscriptExample]) -> dict[str, float]:
     """估计 mod 任务 PU 先验：pos / (pos + unlabeled)。"""
-    total_pos = sum(int(item.m6a_positions.size) for item in examples)
-    total_unlabeled = sum(int(item.unlabeled_a_positions.size) for item in examples)
-    denom = total_pos + total_unlabeled
-    if denom <= 0:
-        return 0.5
-    return float(total_pos / denom)
+    priors: dict[str, float] = {}
+    for mt in MOD_TYPE_NAMES:
+        total_pos = sum(
+            item.mod_positions.get(mt, np.zeros(0)).size for item in examples
+        )
+        total_unl = sum(
+            item.unlabeled_positions.get(mt, np.zeros(0)).size for item in examples
+        )
+        denom = total_pos + total_unl
+        priors[mt] = float(total_pos / denom) if denom > 0 else 0.5
+    return priors
+    # total_pos = sum(int(item.m6a_positions.size) for item in examples)
+    # total_unlabeled = sum(int(item.unlabeled_a_positions.size) for item in examples)
+    # denom = total_pos + total_unlabeled
+    # if denom <= 0:
+    #     return 0.5
+    # return float(total_pos / denom)
 
 
-def estimate_binding_priors(examples: list[TranscriptExample]) -> dict[str, float]:
+def estimate_binding_priors(examples: list[TranscriptExample]) -> dict[str, dict[str, float]]:
     """估计各 role 绑定任务先验（正例比例）。"""
-    out: dict[str, float] = {}
-    for role in ("writer", "reader", "eraser"):
-        positives = 0
-        total = 0
-        for item in examples:
-            labels = item.role_labels.get(role)
-            if labels is None:
-                continue
-            positives += int((labels == 1).sum())
-            total += int(labels.shape[0])
-        if total == 0:
-            out[role] = 0.5
-        else:
-            out[role] = float(positives / total)
+    out: dict[str, dict[str, float]] = {}
+    for mt in MOD_TYPE_NAMES:
+        role_priors: dict[str, float] = {}
+        for role in ROLE_NAMES:
+            positives = 0
+            total = 0
+            for item in examples:
+                labels = item.role_labels.get(mt, {}).get(role)
+                if labels is None:
+                    continue
+                positives += int((labels == 1).sum())
+                total += int(labels.shape[0])
+            role_priors[role] = float(positives / total) if total > 0 else 0.5
+        out[mt] = role_priors
     return out
+    # for role in ("writer", "reader", "eraser"):
+    #     positives = 0
+    #     total = 0
+    #     for item in examples:
+    #         labels = item.role_labels.get(role)
+    #         if labels is None:
+    #             continue
+    #         positives += int((labels == 1).sum())
+    #         total += int(labels.shape[0])
+    #     if total == 0:
+    #         out[role] = 0.5
+    #     else:
+    #         out[role] = float(positives / total)
+    # return out
 
 ################### bind 相关
-def estimate_strong_binding_thresholds(examples: list[TranscriptExample], q: float = 0.75) -> dict[str, float]:
-    """估计各 role 的强结合阈值（正例 support 的 q 分位数）。"""
-    out: dict[str, float] = {}
-    for role in ("writer", "reader", "eraser"):
-        supports: list[int] = []
-        for item in examples:
-            labels = item.role_labels.get(role)
-            support = item.role_support.get(role)
-            if labels is None or support is None:
-                continue
-            positive_support = support[labels == 1]
-            if positive_support.size > 0:
-                supports.extend(int(x) for x in positive_support.tolist())
-        if supports:
-            out[role] = float(np.quantile(np.asarray(supports, dtype=np.float32), q=q))
-        else:
-            out[role] = 1.0
+def estimate_strong_binding_thresholds(examples: list[TranscriptExample], q: float = 0.75) ->  dict[str, dict[str, float]]:
+    """估计各 (mod_type, role) 的强结合阈值（正例 support 的 q 分位数）。"""
+    out: dict[str, dict[str, float]] = {}
+    for mt in MOD_TYPE_NAMES:
+        role_thresholds: dict[str, float] = {}
+        for role in ROLE_NAMES:
+            supports: list[int] = []
+            for item in examples:
+                labels = item.role_labels.get(mt, {}).get(role)
+                support = item.role_support.get(mt, {}).get(role)
+                if labels is None or support is None:
+                    continue
+                positive_support = support[labels == 1]
+                if positive_support.size > 0:
+                    supports.extend(int(x) for x in positive_support.tolist())
+            if supports:
+                role_thresholds[role] = float(
+                    np.quantile(np.asarray(supports, dtype=np.float32), q=q)
+                )
+            else:
+                role_thresholds[role] = 1.0
+        out[mt] = role_thresholds
     return out
+    # for role in ("writer", "reader", "eraser"):
+    #     supports: list[int] = []
+    #     for item in examples:
+    #         labels = item.role_labels.get(role)
+    #         support = item.role_support.get(role)
+    #         if labels is None or support is None:
+    #             continue
+    #         positive_support = support[labels == 1]
+    #         if positive_support.size > 0:
+    #             supports.extend(int(x) for x in positive_support.tolist())
+    #     if supports:
+    #         out[role] = float(np.quantile(np.asarray(supports, dtype=np.float32), q=q))
+    #     else:
+    #         out[role] = 1.0
+    # return out
 
 
 
@@ -597,17 +692,25 @@ def _get_struct_target_matrix(
     )
 
 
-def _estimate_max_sites(examples: list[TranscriptExample], task_name: str) -> int:
+def _estimate_max_sites(examples: list[TranscriptExample], task_name: str, sampled_mod_type: str) -> int:
     """估算当前 batch 在 site 维度上需要的最大容量。"""
     if task_name == "bind":
         site_caps = []
         for item in examples:
-            n_m6a = int(item.m6a_positions.shape[0])
-            n_unl = int(item.unlabeled_a_positions.shape[0])
-            g5_cap = min(n_unl, n_m6a if n_m6a > 0 else 16)
-            site_caps.append(max(1, n_m6a + g5_cap))
-        return max(site_caps)
-    return max(max(1, item.m6a_positions.shape[0]) for item in examples)
+            n_mod = int(item.mod_positions.get(sampled_mod_type, np.zeros(0)).shape[0])
+            n_unl = int(item.unlabeled_positions.get(sampled_mod_type, np.zeros(0)).shape[0])
+            # n_m6a = int(item.m6a_positions.shape[0])
+            # n_unl = int(item.unlabeled_a_positions.shape[0])
+            g5_cap = min(n_unl, n_mod if n_mod > 0 else 16)
+            site_caps.append(max(1, n_mod + g5_cap))
+            # g5_cap = min(n_unl, n_m6a if n_m6a > 0 else 16)
+            # site_caps.append(max(1, n_m6a + g5_cap))
+        return max(site_caps) if site_caps else 1
+
+    return max(
+        max(1, item.mod_positions.get(sampled_mod_type, np.zeros(0)).shape[0])
+        for item in examples
+    )
 
 
 def collate_batch(
@@ -615,29 +718,27 @@ def collate_batch(
     task_name: str,
     role_name: str,
     cond_base: str,
+    sampled_mod_type: str,  
     struct_provider: BPPCache,
     strong_binding_threshold: float,
     rng: random.Random,
     mod_unlabeled_ratio: float = 1.0,
     mask_prob: float = 0.15,
-    # A' 输入增强相关参数（默认值）：
     aprime_enable: bool = True,
     aprime_prob: float = 0.1,
     aprime_max_per_seq: int = -1,
-    # 是否把 RNAfold 逐位点统计注入 struct_feats 前两维（默认关闭）。关闭时，RNAfold 仅用于 struct监督，不作为模型输入特征。
-    use_rnafold_struct_feats: bool = True,
 ) -> dict[str, torch.Tensor | list[str]]:
+    
     """把一组 TranscriptExample 打包成模型输入张量。
 
     该函数同时服务多任务（mod/bind/struct/mask），统一返回以下字段。
 
     输入字段：
-    - tokens: [B,L] 主序列 token（A' 随机替换）
+    - tokens: [B,L] 主序列 token（随机替换）
     - attn_mask: [B,L] 有效 token 掩码（True=非 padding）
-    - struct_feats: [B,L,8] 位点辅助特征（结构统计 + one-hot + 相对位置）
 
     mod 任务监督：
-    - mod_pu_labels: [B,L]，1=positive m6A，-1=unlabeled A，0=不参与监督
+    - mod_pu_labels: [B,L]，1=positive，-1=unlabeled，0=不参与监督
     - mod_pu_mask: [B,L]，True 的位置才参与 mod loss
 
     bind 任务监督（site 级）：
@@ -655,17 +756,15 @@ def collate_batch(
     struct 任务监督：
     - struct_target: [B,L',L'] RNAfold 下采样结构目标（默认 16 倍）（也就是struct_mats）
     - struct_lengths: [B] 每条样本有效 L'
-
     """
     # 动态 padding 形状：按本 batch 最大序列长度与最大位点数分配。
     batch_size = len(examples) # 当前 batch 里有多少条转录本样本（B）
     max_len = max(item.seq_len for item in examples) # 都按这个长度做 padding
-    max_sites = _estimate_max_sites(examples, task_name=task_name)
+    max_sites = _estimate_max_sites(examples, task_name=task_name, sampled_mod_type=sampled_mod_type)
 
     # 初始化输出张量
     tokens = np.full((batch_size, max_len), PAD_TOKEN_ID, dtype=np.int64)
     attn_mask = np.zeros((batch_size, max_len), dtype=bool)
-    struct_feats = np.zeros((batch_size, max_len, 8), dtype=np.float32)
     mod_pu_labels = np.zeros((batch_size, max_len), dtype=np.int64)
     mod_pu_mask = np.zeros((batch_size, max_len), dtype=bool)
     site_positions = np.full((batch_size, max_sites), -1, dtype=np.int64)
@@ -689,37 +788,24 @@ def collate_batch(
     for row_idx, item in enumerate(examples): # 遍历 batch 里的每条转录本
         transcript_ids.append(item.transcript_id)
         rng_aprime, rng_unlabeled = _spawn_row_rngs(rng) # 随机源拆分：一个用于 A' 替换，一个用于未标注位点采样
+    
+        current_mod_positions = item.mod_positions.get(sampled_mod_type, np.zeros(0, dtype=np.int64))
 
-        # 把原始序列编码成 token，并按配置在 m6A 位点里随机把部分 A 替成 A'
+        # ── 序列编码 + 修饰 token 替换 ──
         seq_ids, replaced_positions = encode_with_optional_aprime(
         # seq_ids是替换后的 token 序列，replaced_positions 是被替换成 A' 的位置（0-based）
             sequence=item.sequence,
-            m6a_positions=item.m6a_positions,
+            mod_positions=current_mod_positions,
+            mod_type=sampled_mod_type,
             aprime_enable=aprime_enable,
             aprime_prob=aprime_prob,
             aprime_max_per_seq=aprime_max_per_seq,
             rng_aprime=rng_aprime,
-            a_token_id=BASE_TO_ID["A"],
         )
         # 写进 token
         length = seq_ids.shape[0] 
         tokens[row_idx, :length] = seq_ids
         attn_mask[row_idx, :length] = True
-
-        # ################### 结构输入特征构造策略：
-
-        # - 当前默认：不把 RNAfold 统计喂给模型输入（防止结构监督信号直接泄漏到输入）。
-        # - 若 use_rnafold_struct_feats=True，可恢复旧行为：前两维注入 pair_prob/pair_count。
-        # 无论该开关如何，struct 任务的监督目标 struct_target 来自 RNAfold 下采样矩阵。
-        pair_prob, pair_count, use_mod_a_row = _get_struct_pair_stats(
-            struct_provider=struct_provider,
-            item=item,
-            replaced_positions=replaced_positions, # 传入之前替换好的序列
-            length=length,
-            use_rnafold_struct_feats=use_rnafold_struct_feats,
-        ) # pair_prob：每个位置的配对概率统计（1D）；pair_count：每个位置参与配对的次数统计（1D）
-        struct_feat = _build_struct_features(seq_ids, item.m6a_positions, pair_prob[:length], pair_count[:length])
-        struct_feats[row_idx, :length] = struct_feat
 
         # ############################ mod 任务标签构造：
         """
@@ -735,54 +821,55 @@ def collate_batch(
             - 目标是让 label=1 的位点得分高于 label=-1 的位点
         """
         if task_name == "mod":
-            positives = item.m6a_positions # 替换好的 m6A 位点
+            positives = current_mod_positions
             if positives.size > 0:
                 mod_pu_labels[row_idx, positives] = 1 #（标正类）
                 mod_pu_mask[row_idx, positives] = True # 这些标注位置参与 mod loss
 
-            unlabeled = item.unlabeled_a_positions # 普通 A 候选（未标注）
+            unlabeled = item.unlabeled_positions.get(sampled_mod_type, np.zeros(0, dtype=np.int64))
 
             if positives.size > 0: # 有正例时：target_unlabeled ≈ 正例数 * ratio （保持正/未标注的大致平衡）
                 target_unlabeled = max(1, int(round(float(positives.size) * mod_unlabeled_ratio)))
             else: # 没正例时：最多 64
                 target_unlabeled = min(64, int(unlabeled.size))
 
-            if unlabeled.size > 0 and target_unlabeled > 0: # “有未标注A可选”且“目标采样数>0”
-                sampled_u = _sample_indices_or_all(unlabeled, target_unlabeled, rng_unlabeled) # 从未标注 A 中采样固定数量（或全取）
+            if unlabeled.size > 0 and target_unlabeled > 0: 
+                sampled_u = _sample_indices_or_all(unlabeled, target_unlabeled, rng_unlabeled) # 从未标注中采样固定数量（或全取）
                 mod_pu_labels[row_idx, sampled_u] = -1 # PU里的未标注 A 记为 -1
                 mod_pu_mask[row_idx, sampled_u] = True # 这些未标注位置要参与mod损失
 
         ############################### bind 任务监督：site 级标签 + 强结合掩码 + G1~G5 分组。
         if task_name == "bind":
-            current_sites = item.m6a_positions
+            current_sites = current_mod_positions
             n_sites = int(current_sites.shape[0])
             if n_sites > 0:
                 site_positions[row_idx, :n_sites] = current_sites
                 site_mask[row_idx, :n_sites] = True
 
-                labels = item.role_labels.get(role_name) # 当前 role（writer/reader/eraser）的 PU 标签
-                support = item.role_support.get(role_name) # 取当前 role 的证据计数
+                labels = item.role_labels.get(sampled_mod_type, {}).get(role_name)
+                support_arr = item.role_support.get(sampled_mod_type, {}).get(role_name)
                 if labels is None:
                     labels = np.full((n_sites,), -1, dtype=np.int64)
-                if support is None:
-                    support = np.zeros((n_sites,), dtype=np.int64)
+                if support_arr is None:
+                    support_arr = np.zeros((n_sites,), dtype=np.int64)
 
-                site_pu_labels[row_idx, :n_sites] = labels[:n_sites] # 写入 site 级 PU 标签
-                site_support[row_idx, :n_sites] = support[:n_sites].astype(np.float32) # 写入 site 级证据强度
+                site_pu_labels[row_idx, :n_sites] = labels[:n_sites]# 写入 site 级 PU 标签
+                site_support[row_idx, :n_sites] = support_arr[:n_sites].astype(np.float32) # 写入 site 级证据强度
 
                 # 强结合定义：正例且 support>=阈值。
                 positives = labels[:n_sites] == 1
-                strong_here = positives & (support[:n_sites] >= strong_binding_threshold) # 正例且证据达到阈值 -> 强结合位点
+                strong_here = positives & (support_arr[:n_sites] >= strong_binding_threshold) # 正例且证据达到阈值 -> 强结合位点
                 strong_mask[row_idx, :n_sites] = strong_here # 写入强结合掩码
 
                 # G1~G4 分组赋值：
-                # - 依据两个维度划分：是否被替换为 A'、role_label(1/-1)
-                # - 这里仅在 m6A 位点子集上定义 G1~G4。
+                # - 依据两个维度划分：是否被替换、role_label(1/-1)
                 replaced_set = set(int(x) for x in replaced_positions.tolist())
                 # 对每个 m6A 位点判断是否在 A' 替换集合中
-                is_revealed = np.asarray([int(pos) in replaced_set for pos in current_sites[:n_sites]], dtype=bool)
-                is_pos = labels[:n_sites] == 1 # m6A 位点中 role 正例掩码
-                is_unl = labels[:n_sites] == -1 # m6A 位点中 role 未标注掩码
+                is_revealed = np.asarray(
+                    [int(pos) in replaced_set for pos in current_sites[:n_sites]], dtype=bool,
+                )
+                is_pos = labels[:n_sites] == 1 # 位点中 role 正例掩码
+                is_unl = labels[:n_sites] == -1 # 位点中 role 未标注掩码
 
                 g1_mask[row_idx, :n_sites] = is_revealed & is_pos
                 g2_mask[row_idx, :n_sites] = is_revealed & is_unl
@@ -790,18 +877,20 @@ def collate_batch(
                 g4_mask[row_idx, :n_sites] = (~is_revealed) & is_unl
 
             # G5 分组（bind 专用）：
-            # 从非 m6A 的 A 位点里采样一批锚点，追加到 site_positions 后部。
+            # 从非修饰位点里采样一批锚点，追加到 site_positions 后部。
             # 这些位置没有 role 标签，统一按 unlabeled 处理（site_pu_labels=-1）。
-            unlabeled_a = item.unlabeled_a_positions # 取非 m6A 的普通 A 位点（候选 G5）
-            if unlabeled_a.size > 0:
+            unlabeled_for_g5 = item.unlabeled_positions.get(
+                sampled_mod_type, np.zeros(0, dtype=np.int64),
+            )
+            if unlabeled_for_g5.size > 0:
                 # 采样数量策略与 max_sites 预留一致。
                 if n_sites > 0:
-                    target_g5 = min(int(unlabeled_a.size), n_sites) # 若有 m6A，G5 数量不超过 m6A 数量（平衡）
+                    target_g5 = min(int(unlabeled_for_g5.size), n_sites) 
                 else:
-                    target_g5 = min(int(unlabeled_a.size), 16) # 若无 m6A，最多取 16 个 G5
+                    target_g5 = min(int(unlabeled_for_g5.size), 16) 
 
-                if target_g5 > 0: # # 从普通 A 候选中随机采样（不够则全取）
-                    sampled_g5 = _sample_indices_or_all(unlabeled_a, target_g5, rng_unlabeled) 
+                if target_g5 > 0: # # 从普通候选中随机采样（不够则全取）
+                    sampled_g5 = _sample_indices_or_all(unlabeled_for_g5, target_g5, rng_unlabeled) 
 
                     # G5 从 site 槽位的第 n_sites 个位置开始写（接在 m6A 后面）
                     start = n_sites
@@ -819,7 +908,7 @@ def collate_batch(
         if task_name == "mask":
             mlm_input[row_idx, :length] = seq_ids
             # 仅对标准 RNA 碱基 A/C/G/U 做 MLM 采样；
-            # 不 mask A'（以及 N/[PAD]/[MASK] 等），让 A' 作为上下文保留。
+            # 不 mask 随机替换（以及 N/[PAD]/[MASK] 等），让修饰作为上下文保留。
             valid = (
                 (seq_ids == BASE_TO_ID["A"])
                 | (seq_ids == BASE_TO_ID["C"])
@@ -837,6 +926,7 @@ def collate_batch(
             mlm_input[row_idx, :length] = seq_ids
 
         # 结构目标按 16 倍下采样后的长度记录。
+        use_mod_a_row = bool(replaced_positions.size > 0)
         l_prime = int(math.ceil(length / 16))
         struct_lengths[row_idx] = l_prime
         mat = _get_struct_target_matrix(
@@ -860,7 +950,6 @@ def collate_batch(
     return {
         "tokens": torch.tensor(tokens, dtype=torch.long),
         "attn_mask": torch.tensor(attn_mask, dtype=torch.bool),
-        "struct_feats": torch.tensor(struct_feats, dtype=torch.float32),
         "mod_pu_labels": torch.tensor(mod_pu_labels, dtype=torch.long),
         "mod_pu_mask": torch.tensor(mod_pu_mask, dtype=torch.bool),
         "site_positions": torch.tensor(site_positions, dtype=torch.long),
@@ -879,4 +968,3 @@ def collate_batch(
         "struct_lengths": torch.tensor(struct_lengths, dtype=torch.long),
         "transcript_ids": transcript_ids,
     }
-

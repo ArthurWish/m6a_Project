@@ -19,7 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from .losses import evidential_positive_loss, grouped_binding_loss, structure_bce_dice_loss
-
+from .constants import MOD_BASE_CHANNEL
 
 def compute_uncertainty_loss(
     uncertainty: torch.Tensor,
@@ -65,9 +65,9 @@ def compute_multitask_losses(
     outputs: dict[str, torch.Tensor],
     batch: dict,
     args: argparse.Namespace,
-    supervised_a: bool,
     sampled_role: str,
-    mod_pu_loss,
+    sampled_mod_type: str,   
+    mod_pu_loss: dict,
     bind_pu_loss: dict,
 ) -> dict[str, torch.Tensor]:
     """按任务类型计算并组合损失，返回统一字典。
@@ -77,9 +77,8 @@ def compute_multitask_losses(
     - outputs: 模型前向输出字典
     - batch: collate 后批数据（含标签、mask、分组信息）
     - args: 训练参数命名空间（包含开关与阈值）
-    - supervised_a: 当前条件是否为 A（legacy bind/mod 会用到）
     - sampled_role: 当前 bind 任务采样到的 role（writer/reader/eraser）
-    - mod_pu_loss: mod 任务的 nnPU 损失对象
+    - sampled_mod_type: 当前 mod 任务采样到的修饰类型
     - bind_pu_loss: bind 任务按 role 分开的 nnPU 损失对象
 
     返回：
@@ -101,6 +100,8 @@ def compute_multitask_losses(
     # 2) legacy loss（原 PU + evidential + uncertainty 约束）
     if task_name == "bind":
         bind_probs = torch.sigmoid(outputs["bind_logits"])
+        _bind_pu = bind_pu_loss.get(sampled_mod_type, {}).get(sampled_role)
+
         if args.bind_grouped_loss:
             # G1~G5 分组损失：更细粒度地控制 reveal/unlabeled/普通A 行为。
             g1_mask = batch["g1_mask"] & batch["site_mask"]
@@ -113,11 +114,12 @@ def compute_multitask_losses(
             pu_labels = torch.zeros_like(batch["site_pu_labels"])
             pu_labels = torch.where(g1_mask, torch.ones_like(pu_labels), pu_labels)
             pu_labels = torch.where(g2_mask, -torch.ones_like(pu_labels), pu_labels)
-            loss_bind = bind_pu_loss[sampled_role](
-                logits=outputs["bind_logits"],
-                labels=pu_labels,
-                mask=pu_mask,
-            )
+            if _bind_pu is not None:
+                loss_bind = _bind_pu(
+                    logits=outputs["bind_logits"],
+                    labels=pu_labels,
+                    mask=pu_mask,
+                )
 
             grouped = grouped_binding_loss(
                 logits=outputs["bind_logits"],
@@ -136,35 +138,15 @@ def compute_multitask_losses(
             if not args.ablate_no_dirichlet:
                 loss_dir = grouped["dir"]
             loss_unc = grouped["unc"]
-        else:
-            # Legacy bind：
-            # 仅在 supervised_a 条件下计算 PU 主损失与 evidential 正例损失。
-            if supervised_a:
-                loss_bind = bind_pu_loss[sampled_role](
-                    logits=outputs["bind_logits"],
-                    labels=batch["site_pu_labels"],
-                    mask=batch["site_mask"],
-                )
-                if not args.ablate_no_dirichlet:
-                    positive_mask = (batch["site_pu_labels"] == 1) & batch["site_mask"]
-                    loss_dir = evidential_positive_loss(outputs["bind_alpha"], positive_mask=positive_mask)
-            # 不确定度项可在有/无监督两种模式下计算。
-            loss_unc = compute_uncertainty_loss(
-                uncertainty=outputs["bind_uncertainty"],
-                probs=bind_probs,
-                strong_mask=batch["strong_binding_mask"],
-                site_mask=batch["site_mask"],
-                supervised=supervised_a,
-                supervised_unc_max=args.bind_legacy_supervised_unc_max,
-                supervised_prob_min=args.bind_legacy_supervised_prob_min,
-                unsupervised_unc_min=args.bind_legacy_unsupervised_unc_min,
-            )
+        
 
     # ---- mod 任务 ----
-    # 当前策略：在 mod 任务中始终计算 nnPU 主损失（不再受 supervised_a 门控）。
+    # 当前策略：在 mod 任务中始终计算 nnPU 主损失
     elif task_name == "mod":
-        loss_mod = mod_pu_loss(
-            logits=outputs["mod_logits_acu"][..., 0],
+        channel = MOD_BASE_CHANNEL.get(sampled_mod_type, 0)
+        _mod_pu = mod_pu_loss.get(sampled_mod_type)
+        loss_mod = _mod_pu(
+            logits=outputs["mod_logits_acu"][..., channel],
             labels=batch["mod_pu_labels"],
             mask=batch["mod_pu_mask"],
         )

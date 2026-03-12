@@ -16,11 +16,11 @@ from __future__ import annotations
 CONFIG = {
     # ==================== 数据路径与规模 ====================
     # 位点表（每条 m6A 位点 + writer/reader/eraser 标签与支持度）
-    "sites": "data/processed/m6a_multitask_sites.parquet",
+    "sites": "data/processed/all_multitask_sites.parquet",
     # 转录本表（full_sequence + m6a_positions）
-    "transcripts": "data/processed/m6a_multitask_transcripts.parquet",
+    "transcripts": "data/processed/all_multitask_transcripts.parquet",
     # 数据划分文件（train/val/test transcript_id 列表）
-    "splits": "data/processed/m6a_multitask_splits.json",
+    "splits": "data/processed/all_multitask_splits.json",
     # RNAfold 稀疏 BPP 缓存目录
     "rnafold_cache": "data/processed/rnafold_bpp",
     # 预留：单位点替换(A->6)离线 RNAfold 稠密缓存目录（当前训练尚未接入）
@@ -30,12 +30,12 @@ CONFIG = {
     # smoke 联调用采样比例；1.0 表示全量
     "smoke_ratio": 1.0,
     # 动态 batch 的 token 预算（不是固定 batch_size）
-    "batch_token_budget": 24000,
+    "batch_token_budget": 36000,
     # 输出目录（ckpt、config、metrics、tensorboard）
     "output_dir": "outputs/etd_multitask/full_run",
 
     # ==================== 训练与优化超参数 ====================
-    "epochs": 6,
+    "epochs": 100,
     # 梯度累积步数：等效总 batch 提升约为 grad_accum 倍
     "grad_accum": 4,
     "lr": 2e-4,
@@ -88,6 +88,7 @@ CONFIG = {
     "cond_mask_role_prob": 0.3,
     # 条件 base 随机置空概率（mask）
     "cond_mask_base_prob": 0.3,
+    "cond_mask_mod_type_prob": 0.3,
     # 结构损失最小碱基距离约束
     "struct_min_sep": 4,
     # 动态 batch 长度分桶边界
@@ -104,7 +105,7 @@ CONFIG = {
     "ablate_no_struct": False,
 
     # ==================== 运行环境与日志 ====================
-    "seed": 42,
+    "seed": 2026,
     "device": "cuda",
     "amp": True,
     "no_amp": False,
