@@ -110,16 +110,28 @@ def compute_multitask_losses(
             g5_mask = batch["g5_mask"] & batch["site_mask"]
 
             # G1/G2 使用与 legacy 一致的同一套 nnPU 主损失。
-            pu_mask = g1_mask | g2_mask
-            pu_labels = torch.zeros_like(batch["site_pu_labels"])
-            pu_labels = torch.where(g1_mask, torch.ones_like(pu_labels), pu_labels)
-            pu_labels = torch.where(g2_mask, -torch.ones_like(pu_labels), pu_labels)
-            if _bind_pu is not None:
-                loss_bind = _bind_pu(
-                    logits=outputs["bind_logits"],
-                    labels=pu_labels,
-                    mask=pu_mask,
-                )
+            # pu_mask = g1_mask | g2_mask
+            # pu_labels = torch.zeros_like(batch["site_pu_labels"])
+            # pu_labels = torch.where(g1_mask, torch.ones_like(pu_labels), pu_labels)
+            # pu_labels = torch.where(g2_mask, -torch.ones_like(pu_labels), pu_labels)
+            pu_mask = batch["site_mask"] & (~batch["g5_mask"])
+            # pu_labels = batch["site_pu_labels"]
+            bce_labels = torch.where(batch["site_pu_labels"] == -1, 
+                                     torch.zeros_like(batch["site_pu_labels"]), 
+                                     batch["site_pu_labels"]).float()
+            
+            # if _bind_pu is not None:
+            #     loss_bind = _bind_pu(
+            #         logits=outputs["bind_logits"],
+            #         labels=pu_labels,
+            #         mask=pu_mask,
+            #     )
+            #退化到交叉熵
+            loss_bind = F.binary_cross_entropy_with_logits(
+                outputs["bind_logits"][pu_mask], 
+                bce_labels[pu_mask],
+                reduction="mean"
+            )
 
             grouped = grouped_binding_loss(
                 logits=outputs["bind_logits"],
@@ -130,6 +142,7 @@ def compute_multitask_losses(
                 g3_mask=g3_mask,
                 g5_mask=g5_mask,
                 g3_prob_max=args.bind_g3_prob_max,
+                g3_unc_min=args.bind_g3_unc_min,
                 g5_prob_max=args.bind_g5_prob_max,
                 g5_unc_min=args.bind_g5_unc_min,
                 g1_unc_max=args.bind_g1_unc_max,

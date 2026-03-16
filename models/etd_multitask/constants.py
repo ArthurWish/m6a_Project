@@ -90,9 +90,9 @@ MOD_TYPE_NAMES = ("m6A", "m1A", "m5C", "pseu")
 
 
 TASK_PROBS = {
-    "bind": 0.60,
-    "mod": 0.25,
+    "bind": 0.1,
+    "mod": 0.1,
     "struct": 0.0,
-    "mask": 0.15,
+    "mask": 0.8,
 }
 

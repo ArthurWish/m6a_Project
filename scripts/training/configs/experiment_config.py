@@ -80,11 +80,11 @@ def build_train_arg_parser(repo_root: Path) -> argparse.ArgumentParser:
 
     # ---- 训练与优化超参数 ----
     parser.add_argument("--epochs", type=int, default=6, help="训练轮数。")
-    parser.add_argument("--grad-accum", type=int, default=4, help="梯度累积步数；每累计这么多 batch 才执行一次 optimizer.step。")
+    parser.add_argument("--grad-accum", type=int, default=1, help="梯度累积步数；每累计这么多 batch 才执行一次 optimizer.step。")
     parser.add_argument("--lr", type=float, default=2e-4, help="AdamW 初始学习率。")
     parser.add_argument("--min-lr", type=float, default=2e-5, help="余弦退火到末尾时的最小学习率。")
     parser.add_argument("--weight-decay", type=float, default=1e-2, help="AdamW 权重衰减系数。")
-    parser.add_argument("--warmup-steps", type=int, default=2000, help="学习率 warmup 步数。")
+    parser.add_argument("--warmup-steps", type=int, default=500, help="学习率 warmup 步数。")
     parser.add_argument("--grad-clip", type=float, default=1.0, help="每次优化步前做梯度裁剪的 max norm。")
 
     # ---- 多任务采样与损失相关 ----
@@ -118,7 +118,8 @@ def build_train_arg_parser(repo_root: Path) -> argparse.ArgumentParser:
         default=True,
         help="是否启用 bind 的 G1~G5 分组损失；关闭则退回 legacy bind loss。",
     )
-    parser.add_argument("--bind-g3-prob-max", type=float, default=0.3, help="G3 组概率上界；超过该值会被惩罚。")
+    parser.add_argument("--bind-g3-prob-max", type=float, default=0.85, help="G3 组概率上界；超过该值会被惩罚。")
+    parser.add_argument("--bind-g3-unc-min", type=float, default=0.4, help="G3 组不确定度下界；低于该值会被惩罚。")
     parser.add_argument("--bind-g5-prob-max", type=float, default=0.2, help="G5 普通 A 锚点的概率上界。")
     parser.add_argument("--bind-g5-unc-min", type=float, default=0.6, help="G5 普通 A 锚点的不确定度下界。")
     parser.add_argument("--bind-g1-unc-max", type=float, default=0.2, help="G1 正样本的不确定度上界。")
@@ -127,12 +128,12 @@ def build_train_arg_parser(repo_root: Path) -> argparse.ArgumentParser:
     parser.add_argument("--bind-legacy-unsupervised-unc-min", type=float, default=0.6, help="legacy bind loss 下，未监督位点的不确定度下界。")
 
     # 总损失权重（由 task_loss_composer 使用）。
-    parser.add_argument("--loss-w-mod", type=float, default=1.0, help="mod 主损失权重。")
-    parser.add_argument("--loss-w-bind", type=float, default=1.2, help="bind 主损失权重。")
-    parser.add_argument("--loss-w-dir-in-bind", type=float, default=0.2, help="bind 中 Dirichlet/evidential 子项的附加权重。")
+    parser.add_argument("--loss-w-mod", type=float, default=0.5, help="mod 主损失权重。")
+    parser.add_argument("--loss-w-bind", type=float, default=0.5, help="bind 主损失权重。")
+    parser.add_argument("--loss-w-dir-in-bind", type=float, default=0.1, help="bind 中 Dirichlet/evidential 子项的附加权重。")
     parser.add_argument("--loss-w-struct", type=float, default=0.8, help="struct 结构矩阵监督损失权重。")
-    parser.add_argument("--loss-w-mlm", type=float, default=0.2, help="MLM 损失权重。")
-    parser.add_argument("--loss-w-unc", type=float, default=0.2, help="bind 中不确定度约束损失权重。")
+    parser.add_argument("--loss-w-mlm", type=float, default=1.0, help="MLM 损失权重。")
+    parser.add_argument("--loss-w-unc", type=float, default=0.05, help="bind 中不确定度约束损失权重。")
 
     parser.add_argument("--cond-mask-role-prob", type=float, default=0.3, help="条件注入中 role 条件被 mask 掉的概率。")
     parser.add_argument("--cond-mask-base-prob", type=float, default=0.3, help="条件注入中 base 条件被 mask 掉的概率。")

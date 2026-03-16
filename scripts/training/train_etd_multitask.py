@@ -57,7 +57,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from contextlib import nullcontext
 
-from models.etd_multitask.constants import COND_BASE_IDS, MOD_TYPE_IDS, MOD_TYPE_NAMES, ROLE_IDS, ROLE_NAMES, TASK_IDS, TASK_PROBS
+from models.etd_multitask.constants import COND_BASE_IDS, MOD_TYPE_IDS, MOD_TYPE_NAMES, ROLE_IDS, ROLE_NAMES, TASK_IDS, TASK_PROBS, MOD_BASE_MAP
 from models.etd_multitask.data import (
     BPPCache,
     apply_condition_mask,
@@ -792,6 +792,65 @@ def _run_train_epoch(
         
         # 两段条件机制：先采样任务条件，再按概率做 mask。
         sampled_role, sampled_base, sampled_mod_type = sample_task_condition(task_name, rng)
+
+        has_bind_positives = False
+        has_mod_positives = False
+
+        if task_name == "bind":
+            # 找当前 batch 里有哪些真正的 bind 正样本
+            valid_bind_conds = []
+            for item in batch_examples:
+                for mt, roles_dict in item.role_labels.items():
+                    for r, labels in roles_dict.items():
+                        if (labels == 1).any():
+                            valid_bind_conds.append((mt, r))
+            
+            valid_bind_conds = list(set(valid_bind_conds))
+
+            # 如果我们盲采的 (mod_type, role) 刚好在 batch 里有正样本，完美
+            if (sampled_mod_type, sampled_role) in valid_bind_conds:
+                has_bind_positives = True
+            elif len(valid_bind_conds) > 0:
+                # 没抽中，但 batch 里有别的 bind 数据！找个替补！
+                # 这样保证了只要当前 Batch 有 bind 数据，就绝不浪费，且一定有正例
+                sampled_mod_type, sampled_role = rng.choice(valid_bind_conds)
+                sampled_base = MOD_BASE_MAP[sampled_mod_type]
+                has_bind_positives = True
+            else:
+                # 整个 batch 连半个 bind 正样本都没有
+                has_bind_positives = False
+        # 不管是 mod 任务，还是 bind 没找到数据准备降级，都检查 mod 数据
+        if task_name == "mod" or (task_name == "bind" and not has_bind_positives):
+            valid_mod_conds = []
+            for item in batch_examples:
+                for mt, pos in item.mod_positions.items():
+                    if pos.size > 0:
+                        valid_mod_conds.append(mt)
+            valid_mod_conds = list(set(valid_mod_conds))
+            
+            if sampled_mod_type in valid_mod_conds:
+                has_mod_positives = True
+            elif len(valid_mod_conds) > 0:
+                sampled_mod_type = rng.choice(valid_mod_conds)
+                sampled_base = MOD_BASE_MAP[sampled_mod_type]
+                has_mod_positives = True
+
+        if task_name == "bind" and not has_bind_positives:
+            if has_mod_positives:
+                task_name = "mod"
+                sampled_role = "none"
+            else:
+                task_name = "mask"
+                sampled_role = "none"
+                sampled_base = "mask"
+                sampled_mod_type = "none"
+                
+        elif task_name == "mod" and not has_mod_positives:
+            task_name = "mask"
+            sampled_role = "none"
+            sampled_base = "mask"
+            sampled_mod_type = "none"
+
         cond_role, cond_base, cond_mod_type = sampled_role, sampled_base, sampled_mod_type
         # cond_role, cond_base, cond_mod_type = apply_condition_mask(
         #     task_name=task_name,
@@ -1088,44 +1147,46 @@ def main() -> None:
 
         # 每个 epoch 后做 reader 验证，作为 best 模型选择依据。
         if is_main:
-            val_t0 = time.perf_counter()
-            eval_model = model.module if isinstance(model, DDP) else model
+            val_metrics = {}
+            if epoch % 10 == 0:
+                val_t0 = time.perf_counter()
+                eval_model = model.module if isinstance(model, DDP) else model
 
 
-            # val_metrics = evaluate_reader_binding(
-            #     model=eval_model,
-            #     examples=val_examples,
-            #     struct_provider=struct_provider,
-            #     strong_thresholds=strong_thresholds,
-            #     batch_token_budget=int(cfg["batch_token_budget"]),
-            #     boundaries=boundaries,
-            #     device=device,
-            # )
-            # mod_val_metrics = evaluate_mod_task(
-            #     model=eval_model,
-            #     examples=val_examples,
-            #     struct_provider=struct_provider,
-            #     batch_token_budget=int(cfg["batch_token_budget"]),
-            #     boundaries=boundaries,
-            #     device=device,
-            # )
-            val_metrics = evaluate_bind_all_types(
-                model=eval_model,
-                examples=val_examples,
-                batch_token_budget=int(cfg["batch_token_budget"]),
-                device=device,
-                neg_ratio=1.0,
-            )
-            mod_val_metrics = evaluate_mod_all_types(
-                model=eval_model,
-                examples=val_examples,
-                batch_token_budget=int(cfg["batch_token_budget"]),
-                boundaries=boundaries,
-                device=device,
-                neg_ratio=1.0,   # 正负 1:1
-            )
-            val_metrics.update(mod_val_metrics)
-            val_elapsed = time.perf_counter() - val_t0
+                # val_metrics = evaluate_reader_binding(
+                #     model=eval_model,
+                #     examples=val_examples,
+                #     struct_provider=struct_provider,
+                #     strong_thresholds=strong_thresholds,
+                #     batch_token_budget=int(cfg["batch_token_budget"]),
+                #     boundaries=boundaries,
+                #     device=device,
+                # )
+                # mod_val_metrics = evaluate_mod_task(
+                #     model=eval_model,
+                #     examples=val_examples,
+                #     struct_provider=struct_provider,
+                #     batch_token_budget=int(cfg["batch_token_budget"]),
+                #     boundaries=boundaries,
+                #     device=device,
+                # )
+                val_metrics = evaluate_bind_all_types(
+                    model=eval_model,
+                    examples=val_examples,
+                    batch_token_budget=int(cfg["batch_token_budget"]),
+                    device=device,
+                    neg_ratio=1.0,
+                )
+                mod_val_metrics = evaluate_mod_all_types(
+                    model=eval_model,
+                    examples=val_examples,
+                    batch_token_budget=int(cfg["batch_token_budget"]),
+                    boundaries=boundaries,
+                    device=device,
+                    neg_ratio=1.0,   # 正负 1:1
+                )
+                val_metrics.update(mod_val_metrics)
+                val_elapsed = time.perf_counter() - val_t0
 
             # 记录 epoch 结果快照。
             epoch_record = {
@@ -1145,25 +1206,27 @@ def main() -> None:
                 writer.add_scalar("train/loss_mlm_epoch", agg["loss_mlm"], epoch)
                 writer.add_scalar("train/loss_unc_epoch", agg["loss_unc"], epoch)
                 writer.add_scalar("train/loss_dir_epoch", agg["loss_dir"], epoch)
-                for role in ROLE_NAMES:
-                    for mt in ["m6A"]:
-                        writer.add_scalar(f"val/bind_{mt}_{role}_auprc", val_metrics[f"bind_{mt}_{role}_auprc"], epoch)
-                        writer.add_scalar(f"val/bind_{mt}_{role}_auroc", val_metrics[f"bind_{mt}_{role}_auroc"], epoch)
-                        writer.add_scalar(f"val/bind_{mt}_{role}_f1", val_metrics[f"bind_{mt}_{role}_f1"], epoch)
-                        writer.add_scalar(f"val/bind_{mt}_{role}_ece", val_metrics[f"bind_{mt}_{role}_ece"], epoch) 
-                writer.add_scalar(f"bind_avg_auprc", val_metrics[f"bind_avg_auprc"], epoch)
-                writer.add_scalar(f"bind_avg_auroc", val_metrics[f"bind_avg_auroc"], epoch) 
-                for mt in MOD_TYPE_NAMES:
-                    writer.add_scalar(f"val/mod_{mt}_auprc", val_metrics[f"mod_{mt}_auprc"], epoch)
-                    writer.add_scalar(f"val/mod_{mt}_auroc", val_metrics[f"mod_{mt}_auroc"], epoch)
-                    writer.add_scalar(f"val/mod_{mt}_f1", val_metrics[f"mod_{mt}_f1"], epoch)
-                    writer.add_scalar(f"val/mod_{mt}_ece", val_metrics[f"mod_{mt}_ece"], epoch)
-                writer.add_scalar(f"mod_avg_auprc", val_metrics[f"mod_avg_auprc"], epoch)
-                writer.add_scalar(f"mod_avg_auroc", val_metrics[f"mod_avg_auroc"], epoch)
-             
-                writer.add_scalar("train/lr_epoch", optimizer.param_groups[0]["lr"], epoch)
+                
+                if epoch % 10 == 0:
+                    for role in ROLE_NAMES:
+                        for mt in ["m6A"]:
+                            writer.add_scalar(f"val/bind_{mt}_{role}_auprc", val_metrics[f"bind_{mt}_{role}_auprc"], epoch)
+                            writer.add_scalar(f"val/bind_{mt}_{role}_auroc", val_metrics[f"bind_{mt}_{role}_auroc"], epoch)
+                            writer.add_scalar(f"val/bind_{mt}_{role}_f1", val_metrics[f"bind_{mt}_{role}_f1"], epoch)
+                            writer.add_scalar(f"val/bind_{mt}_{role}_ece", val_metrics[f"bind_{mt}_{role}_ece"], epoch) 
+                    writer.add_scalar(f"bind_avg_auprc", val_metrics[f"bind_avg_auprc"], epoch)
+                    writer.add_scalar(f"bind_avg_auroc", val_metrics[f"bind_avg_auroc"], epoch) 
+                    for mt in MOD_TYPE_NAMES:
+                        writer.add_scalar(f"val/mod_{mt}_auprc", val_metrics[f"mod_{mt}_auprc"], epoch)
+                        writer.add_scalar(f"val/mod_{mt}_auroc", val_metrics[f"mod_{mt}_auroc"], epoch)
+                        writer.add_scalar(f"val/mod_{mt}_f1", val_metrics[f"mod_{mt}_f1"], epoch)
+                        writer.add_scalar(f"val/mod_{mt}_ece", val_metrics[f"mod_{mt}_ece"], epoch)
+                    writer.add_scalar(f"mod_avg_auprc", val_metrics[f"mod_avg_auprc"], epoch)
+                    writer.add_scalar(f"mod_avg_auroc", val_metrics[f"mod_avg_auroc"], epoch)
+                
+                    writer.add_scalar("train/lr_epoch", optimizer.param_groups[0]["lr"], epoch)
 
-            epoch_elapsed = time.perf_counter() - epoch_t0
+            # epoch_elapsed = time.perf_counter() - epoch_t0
             # 终端打印摘要，便于实时监控。
             # print(
             #     f"第{epoch:03d}轮 | "

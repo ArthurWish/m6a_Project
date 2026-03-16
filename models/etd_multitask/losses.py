@@ -192,7 +192,8 @@ def grouped_binding_loss(
     g2_mask: torch.Tensor,
     g3_mask: torch.Tensor,
     g5_mask: torch.Tensor,
-    g3_prob_max: float = 0.3,
+    g3_prob_max: float = 0.85,
+    g3_unc_min: float = 0.4,
     g5_prob_max: float = 0.2,
     g5_unc_min: float = 0.6,
     g1_unc_max: float = 0.2,
@@ -216,22 +217,24 @@ def grouped_binding_loss(
 
     probs = torch.sigmoid(logits)
 
-    # G3: 负向约束，抑制未 reveal 的正位点出现过高结合概率。
-    loss_g3 = F.relu(probs[g3_mask] - g3_prob_max).mean() if g3_mask.any() else _zero()
-    # G5: 普通 A 锚点，概率不应高。
+    # G3: 概率约束，抑制未 reveal 的正位点出现“过高”的结合概率（超过 0.85 就惩罚）
+    loss_g3_prob = F.relu(probs[g3_mask] - g3_prob_max).mean() if g3_mask.any() else _zero()
+    # G5: 普通 A 锚点，概率不应高
     loss_g5_prob = F.relu(probs[g5_mask] - g5_prob_max).mean() if g5_mask.any() else _zero()
 
-    core = loss_g3 + loss_g5_prob
+    core = loss_g3_prob + loss_g5_prob
 
     # G1 evidential 正例项：鼓励正类证据与强度。
     loss_dir = evidential_positive_loss(alpha, positive_mask=g1_mask)
 
-    # 不确定度约束：
-    # - G1 需要低不确定度
-    # - G5 需要高不确定度
+    # - G1 需要低不确定度 (极度自信)
+    # - G3 需要中高不确定度 (猜对了，但心虚)
+    # - G5 需要高不确定度 (完全不知道)
     loss_g1_unc = F.relu(uncertainty[g1_mask] - g1_unc_max).mean() if g1_mask.any() else _zero()
+    loss_g3_unc = F.relu(g3_unc_min - uncertainty[g3_mask]).mean() if g3_mask.any() else _zero()
     loss_g5_unc = F.relu(g5_unc_min - uncertainty[g5_mask]).mean() if g5_mask.any() else _zero()
-    loss_unc = loss_g1_unc + loss_g5_unc
+    
+    loss_unc = loss_g1_unc + loss_g3_unc + loss_g5_unc
 
     return {
         "core": core,

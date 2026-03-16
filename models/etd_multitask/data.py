@@ -431,7 +431,9 @@ def sample_task_condition(task_name: str, rng: random.Random) -> tuple[str, str]
     """
     if task_name == "bind":
         role = rng.choice(list(ROLE_NAMES))
+        # role = "reader"
         mod_type = rng.choice(list(MOD_TYPE_NAMES))
+        # mod_type = "m6A"
         base = MOD_BASE_MAP[mod_type]
         return role, base, mod_type
     if task_name == "mod":
