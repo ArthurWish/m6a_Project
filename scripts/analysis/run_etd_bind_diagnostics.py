@@ -1,0 +1,1 @@
+diagnostics/run_etd_bind_diagnostics.py
