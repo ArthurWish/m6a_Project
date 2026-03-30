@@ -1,6 +1,6 @@
 # Training Experiments
 
-本目录下的训练脚本可以分成 4 条线。
+本目录当前推荐按 `current / legacy` 来理解，而不是继续把所有历史脚本视为并列主线。
 
 ## 1. 单任务 Mask
 
@@ -58,6 +58,9 @@
 - 当前配置:
   - baseline: `configs/etd_together_baseline.py`
   - bias: `configs/etd_together_offline_bias.py`
+- 当前建议:
+  - baseline / bias 都优先从这两个 config 派生
+  - 不要再直接把实验语义堆到旧兼容配置里
 
 ### Legacy
 
@@ -73,6 +76,17 @@
 - 配置: `configs/experiment_config.py` 或 `configs/train_etd_multitask_full.py`
 - 说明: 与单任务 bind 线分开维护
 - 输出目录: `outputs/etd_multitask/...`
+
+## Current vs Legacy
+
+- `train_etd_together.py`
+  - current 主入口
+- `configs/etd_together_baseline.py`
+  - current baseline config
+- `configs/etd_together_offline_bias.py`
+  - current offline bias config
+- `legacy/` 与 `configs/legacy/`
+  - 历史实现，仅兼容保留
 
 ## 常用判断
 

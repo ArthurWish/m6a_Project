@@ -1,14 +1,17 @@
 # Analysis Scripts
 
-当前 analysis 脚本按用途分成 4 类：
+## Current
 
 - `error/`
-  - 错误分析与 member-level 失败案例
+  - 错误分析与 member-level breakdown
 - `motif/`
-  - motif / k-mer / pairwise motif 对比
+  - motif / pairwise motif / k-mer enrichment
 - `diagnostics/`
-  - 诊断矩阵、候选挖掘、选择性绑定检查
+  - 诊断矩阵、候选挖掘、绑定行为检查
 - `eval/`
   - 独立评估脚本
 
-顶层旧文件名仍保留为软链接，便于兼容旧命令；后续新增脚本应直接放到对应子目录。
+## Legacy compatibility
+
+- 顶层旧文件名是兼容软链接，不再作为新增脚本的放置位置。
+- 后续如果新增脚本，直接放到对应子目录，并保持结果目录同步分组。

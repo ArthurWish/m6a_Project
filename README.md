@@ -1,21 +1,33 @@
-# m6A Dataset / ETD 多任务建模代码仓库（最小可复现）
+# m6A Dataset / ETD Modeling Repository
 
 ## 项目简介
-本仓库用于 m6A 多任务建模与实验脚本管理，核心是基于 ETD（Encoder-Transformer-Decoder）主干的多任务模型实现，支持：
+本仓库用于 m6A 建模、ETD 系列训练脚本与分析脚本管理。当前同时包含两条大线：
 
-- 可修饰性预测（PU）
-- RBP role 结合预测（PU + Dirichlet 不确定性）
-- RNA 二级结构矩阵预测（RNAfold BPP 监督）
-- mask 补全（MLM）
+- `models/etd_multitask/`
+  - 整条 transcript 的多任务主线
+- `models/etd_only/` + `scripts/training/train_etd_together.py`
+  - 固定窗口的 `m6A + RBP binding` 联合训练主线
 
-当前仓库按“代码优先最小可复现”策略发布，仅包含源码、脚本、测试和说明文档，不包含原始数据、预训练权重、训练输出结果。
+仓库按“代码优先、数据和输出本地化”维护：
+
+- 版本管理中保留源码、脚本、说明文档
+- `data/` 与 `outputs/` 默认不进 git
 
 ## 当前仓库范围（包含 / 不包含）
 
 ### 包含
-- `models/etd_multitask/`：ETD 多任务模型、loss、metrics、RNAfold 解析工具
-- `scripts/`：数据构建、RNAfold 缓存、训练、评估、分析脚本
-- `tests/`：核心单元测试与 shape/loss 校验
+- `models/etd_multitask/`
+  - 多任务模型、loss、metrics、RNAfold 解析工具
+- `models/etd_only/`
+  - 窗口版 bind / together 模型与 dataloader
+- `scripts/dataset/`
+  - 数据构建与 RNAfold cache 构建脚本
+- `scripts/training/`
+  - 训练入口、配置与训练说明
+- `scripts/analysis/`
+  - 错误分析、motif 分析、diagnostics、eval
+- `tests/`
+  - 核心 shape / loss / parser 测试
 
 ### 不包含（需本地准备）
 - `data/`：RMBase BED、FASTA、处理中间文件、RNAfold 缓存
@@ -27,6 +39,7 @@
 
 ```text
 models/
+  etd_only/
   etd_multitask/
 scripts/
   dataset/
@@ -35,6 +48,22 @@ scripts/
 tests/
 README.md
 ```
+
+## 当前建议入口
+
+### 训练
+- 窗口版 together 主线：
+  - [`scripts/training/train_etd_together.py`](/media/scw-workspace/m6a_dataset/scripts/training/train_etd_together.py)
+- baseline config：
+  - [`scripts/training/configs/etd_together_baseline.py`](/media/scw-workspace/m6a_dataset/scripts/training/configs/etd_together_baseline.py)
+- offline bias config：
+  - [`scripts/training/configs/etd_together_offline_bias.py`](/media/scw-workspace/m6a_dataset/scripts/training/configs/etd_together_offline_bias.py)
+
+### 分析
+- 脚本总览：
+  - [`scripts/analysis/README.md`](/media/scw-workspace/m6a_dataset/scripts/analysis/README.md)
+- 结果总览：
+  - [`outputs/analysis/README.md`](/media/scw-workspace/m6a_dataset/outputs/analysis/README.md)
 
 ## 环境依赖
 
@@ -110,7 +139,7 @@ bash scripts/dataset/run_rnafold_dense_shard3.sh
 - 已存在的 `.npz` 会自动 `skipped`，因此中断后可直接续跑。
 - 只有显式传 `--overwrite` 才会重算并覆盖。
 
-### 3) 训练（smoke 预设，推荐）
+### 3) 训练（multitask 主线，smoke 预设）
 ```bash
 python scripts/training/train_etd_multitask.py --preset smoke_gpu
 ```
@@ -206,6 +235,12 @@ python scripts/analysis/mine_weak_binding_candidates.py \
 - `max_len=12000` 的全量训练对显存要求较高，建议先跑 smoke（如 `4096`）验证链路。
 - `RNAfold` 全量缓存生成耗时较长，建议分批跑并保留 manifest。
 - 当前仓库不含数据与权重，首次复现前需要准备 RMBase/FASTA 输入和本地缓存目录。
+
+## 协作约定
+- `scripts/training/train_etd_together.py` 是当前窗口版 together 主入口。
+- `scripts/training/legacy/` 与 `scripts/training/configs/legacy/` 下的文件仅作兼容保留，不再作为主线维护。
+- `scripts/analysis/` 与 `outputs/analysis/` 已按 `error / motif / diagnostics / eval` 分目录整理；顶层旧文件名保留为兼容路径。
+- 不要提交 `data/processed/`、`outputs/` 下的本地数据、cache、checkpoint 和分析结果。
 
 ## 测试
 仓库包含 `tests/` 下的单元测试（RNAfold parser、数据拼 batch、模型 shape、PU loss、条件 mask、分析脚本函数等）。  
